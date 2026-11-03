@@ -8,9 +8,9 @@ use std::time::SystemTime;
 use diskclean_core::cleaner::{execute, ExecOptions};
 use diskclean_core::duplicates::{find_duplicates, DupOptions};
 use diskclean_core::migrate::{manifest_of, verify_equal, Copier, StdCopier};
-use diskclean_core::plan::{build_plan, Candidate, Plan};
 #[cfg(unix)]
 use diskclean_core::plan::PlanSkipReason;
+use diskclean_core::plan::{build_plan, Candidate, Plan};
 use diskclean_core::registry::{export_keys, to_utf16le_with_bom, Hive, MemRegistry, RegValue};
 use diskclean_core::rules::{Disposal, Env, Risk, Rule, Target, TargetKind};
 use diskclean_core::safety::{PathStyle, SafetyPolicy};
