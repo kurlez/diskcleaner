@@ -1,0 +1,12 @@
+[package]
+name = "diskclean-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "diskclean"
+path = "src/main.rs"
+
+[dependencies]
+diskclean-core = { path = "../core" }

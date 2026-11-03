@@ -1,0 +1,400 @@
+//! 路径安全策略：决定一个路径"能不能被删除"。
+//!
+//! 设计要点：
+//! * 纯字符串逻辑，不访问文件系统，因此可在任意平台上单元测试。
+//! * 按 Windows 语义规范化（大小写不敏感、`/` 与 `\` 等价、去掉末尾的点和空格）。
+//! * 默认拒绝：受保护目录（系统目录、用户文档等）及其祖先、后代都不可删除，
+//!   除非命中更具体的"允许根"（例如 `C:\Windows\Temp`）。
+//!
+//! **调用方责任**：传入前必须先用系统 API（`GetFinalPathNameByHandle`）取得
+//! 规范长路径，本模块会拒绝可疑的 8.3 短名，但不会替你解析它们。
+
+use std::fmt;
+
+/// 无论位于何处，名称命中即拒绝删除的目录/文件名（小写）。
+const PROTECTED_NAMES: &[&str] = &[".git", ".ssh", ".gnupg"];
+
+/// 用户配置文件下默认受保护的目录。
+const PROTECTED_PROFILE_DIRS: &[&str] = &[
+    "Documents",
+    "Desktop",
+    "Pictures",
+    "Videos",
+    "Music",
+    "Downloads",
+    "OneDrive",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Denied {
+    /// 不是 `X:\...` 形式的绝对路径（相对路径、`C:foo`、空串）。
+    NotAbsolute,
+    /// 含 `..`。
+    ContainsParentRef,
+    /// UNC、设备路径、备用数据流、通配符或非法字符。
+    UnsupportedPath,
+    /// 疑似 8.3 短文件名（含 `~数字`），需先取规范长路径。
+    ShortName,
+    /// 盘符根目录。
+    DriveRoot,
+    /// 命中受保护目录（附带该保护根的展示形式）。
+    Protected(String),
+    /// 路径中含受保护名称（如 `.git`）。
+    ProtectedName(String),
+}
+
+impl fmt::Display for Denied {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Denied::NotAbsolute => write!(f, "path is not an absolute drive path"),
+            Denied::ContainsParentRef => write!(f, "path contains '..'"),
+            Denied::UnsupportedPath => write!(f, "unsupported path form"),
+            Denied::ShortName => write!(f, "path looks like an 8.3 short name; canonicalize first"),
+            Denied::DriveRoot => write!(f, "refusing to touch a drive root"),
+            Denied::Protected(p) => write!(f, "protected location: {p}"),
+            Denied::ProtectedName(n) => write!(f, "protected name in path: {n}"),
+        }
+    }
+}
+
+impl std::error::Error for Denied {}
+
+/// 规范化后的路径：第一个分量是小写盘符（如 `c:`），其后为小写目录/文件名。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NormPath(Vec<String>);
+
+impl NormPath {
+    fn parse(input: &str) -> Result<Self, Denied> {
+        let s = input.replace('/', "\\");
+
+        // 仅接受 `\\?\X:\...` 扩展前缀；`\\?\UNC\`、`\\.\` 与普通 UNC 一律拒绝。
+        let s = if let Some(rest) = s.strip_prefix("\\\\?\\") {
+            if rest
+                .get(..4)
+                .is_some_and(|p| p.eq_ignore_ascii_case("UNC\\"))
+            {
+                return Err(Denied::UnsupportedPath);
+            }
+            rest.to_string()
+        } else if s.starts_with("\\\\") {
+            return Err(Denied::UnsupportedPath);
+        } else {
+            s
+        };
+
+        let mut chars = s.chars();
+        let drive = chars.next().ok_or(Denied::NotAbsolute)?;
+        if !drive.is_ascii_alphabetic() || chars.next() != Some(':') {
+            return Err(Denied::NotAbsolute);
+        }
+        if chars.next() != Some('\\') {
+            // "C:" 或 "C:foo" 是相对于盘符当前目录的路径。
+            return Err(Denied::NotAbsolute);
+        }
+
+        let mut parts = vec![format!("{}:", drive.to_ascii_lowercase())];
+        for raw in s[3..].split('\\') {
+            if raw.is_empty() || raw == "." {
+                continue;
+            }
+            if raw == ".." {
+                return Err(Denied::ContainsParentRef);
+            }
+            // Win32 会悄悄丢弃分量末尾的点和空格，"Windows. " 即 "Windows"。
+            let comp = raw.trim_end_matches(['.', ' ']);
+            if comp.is_empty() {
+                // 例如 "..." —— Win32 视其为空分量，语义不明，直接拒绝。
+                return Err(Denied::UnsupportedPath);
+            }
+            if comp
+                .chars()
+                .any(|c| matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control())
+            {
+                return Err(Denied::UnsupportedPath);
+            }
+            if has_short_name_marker(comp) {
+                return Err(Denied::ShortName);
+            }
+            parts.push(comp.to_lowercase());
+        }
+        Ok(NormPath(parts))
+    }
+
+    fn display(&self) -> String {
+        self.0.join("\\")
+    }
+}
+
+/// 8.3 短名形如 `PROGRA~1`：波浪线后紧跟数字。
+fn has_short_name_marker(name: &str) -> bool {
+    let b = name.as_bytes();
+    b.windows(2).any(|w| w[0] == b'~' && w[1].is_ascii_digit())
+}
+
+/// `a` 是否为 `b` 的前缀（含相等）。
+fn is_prefix(a: &[String], b: &[String]) -> bool {
+    a.len() <= b.len() && a.iter().zip(b).all(|(x, y)| x == y)
+}
+
+/// 系统已知目录，由环境变量或测试数据提供。
+#[derive(Debug, Clone)]
+pub struct KnownDirs {
+    pub system_root: String,
+    pub program_files: String,
+    pub program_files_x86: String,
+    pub program_data: String,
+    pub user_profile: String,
+}
+
+impl KnownDirs {
+    /// 从环境变量读取（Windows 下的正常路径）。任一缺失则返回 `None`。
+    pub fn from_env() -> Option<Self> {
+        let get = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        Some(Self {
+            system_root: get("SystemRoot")?,
+            program_files: get("ProgramFiles")?,
+            program_files_x86: get("ProgramFiles(x86)")
+                .unwrap_or_else(|| get("ProgramFiles").unwrap()),
+            program_data: get("ProgramData")?,
+            user_profile: get("USERPROFILE")?,
+        })
+    }
+
+    /// 典型布局（系统装在 C 盘），用于测试和兜底。
+    pub fn typical(user: &str) -> Self {
+        Self {
+            system_root: r"C:\Windows".into(),
+            program_files: r"C:\Program Files".into(),
+            program_files_x86: r"C:\Program Files (x86)".into(),
+            program_data: r"C:\ProgramData".into(),
+            user_profile: format!(r"C:\Users\{user}"),
+        }
+    }
+}
+
+/// 删除安全策略。
+#[derive(Debug, Clone)]
+pub struct SafetyPolicy {
+    protected: Vec<NormPath>,
+    allow: Vec<NormPath>,
+}
+
+impl SafetyPolicy {
+    /// 用默认保护名单构建策略。已知目录若无法解析则返回 `Err`，
+    /// 避免在保护缺失的情况下悄悄继续。
+    pub fn new(dirs: &KnownDirs) -> Result<Self, Denied> {
+        let mut p = SafetyPolicy {
+            protected: Vec::new(),
+            allow: Vec::new(),
+        };
+        for d in [
+            &dirs.system_root,
+            &dirs.program_files,
+            &dirs.program_files_x86,
+            &dirs.program_data,
+            &dirs.user_profile,
+        ] {
+            p.protect(d)?;
+        }
+        let drive = NormPath::parse(&dirs.system_root)?.0[0].clone();
+        for special in [
+            "System Volume Information",
+            "$Recycle.Bin",
+            "Recovery",
+            "Boot",
+        ] {
+            p.protect(&format!("{drive}\\{special}"))?;
+        }
+        for d in PROTECTED_PROFILE_DIRS {
+            p.protect(&format!(
+                "{}\\{}",
+                dirs.user_profile.trim_end_matches('\\'),
+                d
+            ))?;
+        }
+        Ok(p)
+    }
+
+    /// 追加受保护路径（例如用户在设置里配置的排除目录）。
+    pub fn protect(&mut self, path: &str) -> Result<(), Denied> {
+        self.protected.push(NormPath::parse(path)?);
+        Ok(())
+    }
+
+    /// 追加允许根：其**内部**的内容可删除（根本身不算）。
+    /// 允许根比保护根更具体时生效，例如 `C:\Windows\Temp`。
+    pub fn allow_root(&mut self, path: &str) -> Result<(), Denied> {
+        self.allow.push(NormPath::parse(path)?);
+        Ok(())
+    }
+
+    /// 判断 `path` 是否允许被删除。
+    pub fn check_delete(&self, path: &str) -> Result<(), Denied> {
+        let target = NormPath::parse(path)?;
+
+        if target.0.len() == 1 {
+            return Err(Denied::DriveRoot);
+        }
+        for part in &target.0[1..] {
+            if PROTECTED_NAMES.contains(&part.as_str()) {
+                return Err(Denied::ProtectedName(part.clone()));
+            }
+        }
+
+        // 最具体（最长）且严格包含目标的允许根。
+        let allow_len = self
+            .allow
+            .iter()
+            .filter(|a| a.0.len() < target.0.len() && is_prefix(&a.0, &target.0))
+            .map(|a| a.0.len())
+            .max()
+            .unwrap_or(0);
+
+        // 保护根与目标"相交"（互为前缀）即拒绝，除非允许根更具体。
+        for prot in &self.protected {
+            let intersects = is_prefix(&prot.0, &target.0) || is_prefix(&target.0, &prot.0);
+            if intersects && prot.0.len() > allow_len {
+                return Err(Denied::Protected(prot.display()));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy() -> SafetyPolicy {
+        let mut p = SafetyPolicy::new(&KnownDirs::typical("alice")).unwrap();
+        p.allow_root(r"C:\Windows\Temp").unwrap();
+        p.allow_root(r"C:\Users\alice\AppData\Local\Temp").unwrap();
+        p
+    }
+
+    #[test]
+    fn allows_contents_of_allow_roots() {
+        let p = policy();
+        assert!(p.check_delete(r"C:\Windows\Temp\foo.tmp").is_ok());
+        assert!(p.check_delete(r"c:/windows/temp/a/b/c").is_ok());
+        assert!(p
+            .check_delete(r"\\?\C:\Users\alice\AppData\Local\Temp\x")
+            .is_ok());
+    }
+
+    #[test]
+    fn denies_allow_root_itself_when_parent_protected() {
+        let p = policy();
+        assert!(matches!(
+            p.check_delete(r"C:\Windows\Temp"),
+            Err(Denied::Protected(_))
+        ));
+        assert!(matches!(
+            p.check_delete(r"C:\Users\alice\AppData\Local\Temp"),
+            Err(Denied::Protected(_))
+        ));
+    }
+
+    #[test]
+    fn denies_system_and_ancestors() {
+        let p = policy();
+        for path in [
+            r"C:\Windows",
+            r"C:\Windows\System32\kernel32.dll",
+            r"C:\Program Files\App\a.exe",
+            r"C:\Program Files (x86)",
+            r"C:\Users\alice",
+            r"C:\Users\alice\Documents\thesis.docx",
+            r"C:\Users\alice\Desktop",
+            r"C:\System Volume Information",
+            // 祖先：删除它会连带删除受保护内容
+            r"C:\Users",
+        ] {
+            assert!(p.check_delete(path).is_err(), "{path} should be denied");
+        }
+        assert_eq!(p.check_delete(r"C:\"), Err(Denied::DriveRoot));
+    }
+
+    #[test]
+    fn unprotected_locations_are_allowed() {
+        let p = policy();
+        assert!(p.check_delete(r"D:\Games\old.bin").is_ok());
+        assert!(p.check_delete(r"C:\Temp\foo").is_ok());
+    }
+
+    #[test]
+    fn case_and_separator_insensitive() {
+        let p = policy();
+        assert!(p.check_delete(r"c:\WINDOWS\system32").is_err());
+        assert!(p.check_delete("C:/Users/ALICE/documents/x").is_err());
+    }
+
+    #[test]
+    fn trailing_dots_and_spaces_cannot_bypass() {
+        let p = policy();
+        assert!(p.check_delete(r"C:\Windows. \System32").is_err());
+        assert!(p.check_delete(r"C:\Windows.\System32").is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_paths() {
+        let p = policy();
+        assert_eq!(p.check_delete(""), Err(Denied::NotAbsolute));
+        assert_eq!(p.check_delete(r"foo\bar"), Err(Denied::NotAbsolute));
+        assert_eq!(p.check_delete("C:foo"), Err(Denied::NotAbsolute));
+        assert_eq!(p.check_delete(r"\Windows\Temp\x"), Err(Denied::NotAbsolute));
+        assert_eq!(
+            p.check_delete(r"C:\Windows\Temp\..\System32"),
+            Err(Denied::ContainsParentRef)
+        );
+        assert_eq!(
+            p.check_delete(r"\\server\share\x"),
+            Err(Denied::UnsupportedPath)
+        );
+        assert_eq!(
+            p.check_delete(r"\\?\UNC\server\share\x"),
+            Err(Denied::UnsupportedPath)
+        );
+        assert_eq!(
+            p.check_delete(r"C:\Windows\Temp\a:stream"),
+            Err(Denied::UnsupportedPath)
+        );
+        assert_eq!(
+            p.check_delete(r"C:\Windows\Temp\*.tmp"),
+            Err(Denied::UnsupportedPath)
+        );
+        assert_eq!(p.check_delete(r"C:\PROGRA~1\App"), Err(Denied::ShortName));
+    }
+
+    #[test]
+    fn protected_names_denied_anywhere() {
+        let p = policy();
+        assert!(matches!(
+            p.check_delete(r"D:\work\repo\.git\objects"),
+            Err(Denied::ProtectedName(_))
+        ));
+        assert!(matches!(
+            p.check_delete(r"C:\Windows\Temp\.ssh\id_rsa"),
+            Err(Denied::ProtectedName(_))
+        ));
+    }
+
+    #[test]
+    fn user_protection_overrides_unprotected_location() {
+        let mut p = policy();
+        p.protect(r"D:\Photos").unwrap();
+        assert!(p.check_delete(r"D:\Photos\2024\a.jpg").is_err());
+        assert!(p.check_delete(r"D:").is_err());
+    }
+
+    #[test]
+    fn protected_deeper_than_allow_root_still_wins() {
+        let mut p = policy();
+        p.allow_root(r"D:\cache").unwrap();
+        p.protect(r"D:\cache\keep").unwrap();
+        assert!(p.check_delete(r"D:\cache\junk").is_ok());
+        assert!(p.check_delete(r"D:\cache\keep\x").is_err());
+        // 删除 D:\cache 本身会连带删掉 keep
+        assert!(p.check_delete(r"D:\cache").is_err());
+    }
+}
