@@ -3,6 +3,7 @@
   import { formatSize } from '../lib/format';
   import { errorText, t } from '../lib/i18n.svelte';
   import { groupSmall, hueOf, squarify, type Tile } from '../lib/treemap';
+  import { refresh } from '../lib/refresh.svelte';
   import type { Child } from '../lib/types';
 
   let { rootName, parts = $bindable([]) }: { rootName: string; parts: string[] } = $props();
@@ -22,6 +23,7 @@
 
   // 目录变化时重新取数据；用序号丢弃过期的响应。
   $effect(() => {
+    void refresh.scan; // 清理之后重新取当前目录的内容
     const mine = ++seq;
     const target = [...parts];
     loading = true;

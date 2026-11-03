@@ -4,6 +4,7 @@
   import { formatSize, percent } from '../lib/format';
   import { errorText, t } from '../lib/i18n.svelte';
   import { goScan, nav } from '../lib/nav.svelte';
+  import { refresh } from '../lib/refresh.svelte';
   import type { Drive } from '../lib/types';
 
   let drives = $state<Drive[] | null>(null);
@@ -19,6 +20,15 @@
     }
   }
   onMount(load);
+
+  // 清理、迁移之后磁盘的可用空间变了：立刻刷新。
+  let lastDrives = refresh.drives;
+  $effect(() => {
+    if (refresh.drives !== lastDrives) {
+      lastDrives = refresh.drives;
+      api.listDrives().then((d) => (drives = d)).catch(() => {});
+    }
+  });
 
   const used = (d: Drive) => d.total - d.free;
   const level = (d: Drive) => (percent(used(d), d.total) >= 90 ? 'danger' : percent(used(d), d.total) >= 80 ? 'warn' : '');

@@ -16,7 +16,8 @@
   --bar: #cdd6e4;
   --radius: 10px;
   --font: 'Segoe UI Variable', 'Segoe UI', 'Microsoft YaHei UI', system-ui, sans-serif;
-  --mono: 'Cascadia Mono', Consolas, monospace;
+  /* 等宽字体后面补上中日韩与 emoji 的回退字体，长中文文件名不会出现方块或字体突变。 */
+  --mono: 'Cascadia Mono', Consolas, 'Microsoft YaHei UI', 'Noto Sans Mono CJK SC', 'PingFang SC', 'Segoe UI Emoji', monospace;
   color-scheme: light;
 }
 

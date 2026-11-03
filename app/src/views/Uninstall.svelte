@@ -4,6 +4,7 @@
   import { formatSize } from '../lib/format';
   import { errorText, t } from '../lib/i18n.svelte';
   import { goMigrate } from '../lib/nav.svelte';
+  import { afterChange } from '../lib/refresh.svelte';
   import Icon from '../components/Icon.svelte';
   import { iconKind, type IconKind } from '../lib/fileicon';
   import type { AppInfo, Leftover, LeftoverReport, Leftovers } from '../lib/types';
@@ -96,6 +97,7 @@
     try {
       const r = await api.appUninstall(current.id, false);
       exitCode = r.exit_code;
+      afterChange(); // 程序文件已被卸载器删除
       await scan(false);
     } catch (e) {
       error = errorText(e);
@@ -120,6 +122,7 @@
     try {
       report = await api.appDeleteLeftovers([...selected], recycle);
       step = 'done';
+      afterChange();
     } catch (e) {
       error = errorText(e);
       step = 'leftovers';

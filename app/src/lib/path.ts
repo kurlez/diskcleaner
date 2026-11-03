@@ -22,17 +22,16 @@ export function relParts(root: string, path: string): string[] | null {
   return p.slice(r.length + 1).split('\\').filter(Boolean);
 }
 
-const ZWSP = '\u200b';
-
 /**
- * 在路径分隔符之后插入零宽空格，让很长的路径优先在目录边界换行，而不是在单词中间断开。
- * 只用于显示；复制、比较等仍应使用原始路径。
+ * 把路径拆成若干段，每段以分隔符结尾，用来在两段之间放 `<wbr>`：
+ * 让很长的路径优先在目录边界换行，而不是在单词中间断开。
+ * 只在显示时使用，**不往文字里插入任何字符**，所以选中复制出来的仍是原始文本。
  */
-export function breakablePath(path: string): string {
-  return path.replace(/([\\/])/g, `$1${ZWSP}`);
+export function pathSegments(path: string): string[] {
+  return path.match(/[^\\/]*[\\/]|[^\\/]+$/g) ?? [];
 }
 
 /** 文件名：在 `_`、`-`、`.` 之后提供换行机会。 */
-export function breakableName(name: string): string {
-  return name.replace(/([_\-.])/g, `$1${ZWSP}`);
+export function nameSegments(name: string): string[] {
+  return name.match(/[^_\-.]*[_\-.]|[^_\-.]+$/g) ?? [];
 }

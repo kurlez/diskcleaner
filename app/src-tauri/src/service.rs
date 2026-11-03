@@ -213,12 +213,15 @@ pub struct DupProgressDto {
     pub total: u64,
 }
 
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct DupSelection {
     pub group: usize,
     pub file: usize,
+    /// 界面看到的该文件的路径。给出时必须与后端保存的一致：别处的清理可能已经让序号错位，
+    /// 不一致就拒绝，而不是删到别的文件。
+    #[serde(default)]
+    pub path: Option<String>,
 }
-
 #[derive(Debug, Serialize)]
 pub struct SysActionDto {
     pub id: &'static str,
@@ -458,6 +461,9 @@ pub type FastScanFn = dyn Fn(
 struct ScanState {
     root_path: PathBuf,
     root: Node,
+    method: &'static str,
+    fallback: Option<&'static str>,
+    skipped: usize,
 }
 
 pub struct Service {
@@ -616,28 +622,64 @@ impl Service {
             .map_err(|e| ApiError::with("scan_failed", e))?,
         };
 
-        let top_files = scanner::top_files(&root_path, &out.root, TOP_FILES)
-            .into_iter()
-            .map(|(p, size)| FileDto {
-                path: display_path(&p),
-                size,
-            })
-            .collect();
-        let summary = ScanSummary {
-            method,
-            fallback,
-            root: display_path(&root_path),
-            total_size: out.root.size,
-            file_count: out.root.file_count,
-            skipped: out.skipped.len(),
-            cancelled: out.cancelled,
-            top_files,
-        };
-        *self.scan.lock().unwrap() = Some(ScanState {
+        let state = ScanState {
             root_path,
             root: out.root,
-        });
+            method,
+            fallback,
+            skipped: out.skipped.len(),
+        };
+        let summary = summarize(&state, out.cancelled);
+        *self.scan.lock().unwrap() = Some(state);
         Ok(summary)
+    }
+
+    /// 当前保存的扫描结果的摘要。清理或迁移之后，界面用它直接刷新，不需要重新扫描。
+    pub fn scan_current(&self) -> Result<ScanSummary> {
+        let guard = self.scan.lock().unwrap();
+        let state = guard.as_ref().ok_or(ApiError::new("no_scan"))?;
+        Ok(summarize(state, false))
+    }
+
+    /// 这些路径已被删除或搬走：从扫描树和重复文件结果里去掉，并同步修正上级目录的大小。
+    pub(crate) fn prune(&self, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+        if let Some(state) = self.scan.lock().unwrap().as_mut() {
+            for p in paths {
+                if let Some(parts) = scanner::parts_below(&state.root_path, p) {
+                    if !parts.is_empty() {
+                        scanner::remove_path(&mut state.root, &parts);
+                    }
+                }
+            }
+        }
+        if let Some(out) = self.dup.lock().unwrap().as_mut() {
+            let gone: std::collections::HashSet<String> = paths
+                .iter()
+                .map(|p| p.to_string_lossy().to_lowercase())
+                .collect();
+            for g in &mut out.groups {
+                g.files
+                    .retain(|f| !gone.contains(&f.path.to_string_lossy().to_lowercase()));
+            }
+            out.groups.retain(|g| g.files.len() > 1);
+        }
+    }
+
+    /// 某个目录的内容变了（比如刚还原回来）：重新遍历它，并把结果接回扫描树。
+    pub(crate) fn graft(&self, path: &Path) {
+        let Ok(out) = scanner::scan(path, &AtomicBool::new(false), &mut |_| {}) else {
+            return;
+        };
+        if let Some(state) = self.scan.lock().unwrap().as_mut() {
+            if let Some(parts) = scanner::parts_below(&state.root_path, path) {
+                if !parts.is_empty() {
+                    scanner::replace_path(&mut state.root, &parts, out.root);
+                }
+            }
+        }
     }
 
     pub fn cancel_scan(&self) {
@@ -798,6 +840,7 @@ impl Service {
             &self.clean_cancel,
             &mut |done, total| on_progress(CleanProgressDto { done, total }),
         );
+        self.prune(&removed_paths(&report));
         Ok(report_dto(&report, req.dry_run, journal_path))
     }
 
@@ -886,6 +929,7 @@ impl Service {
             }
             out.groups.retain(|g| g.files.len() > 1);
         }
+        self.prune(&removed_paths(&report));
         Ok(report_dto(&report, false, journal_path))
     }
 
@@ -1022,6 +1066,7 @@ impl Service {
         })?;
         drop(guard);
         *self.leftovers.lock().unwrap() = None;
+        self.prune(&removed_paths(&out.files));
         Ok(LeftoverReportDto {
             registry: out
                 .registry
@@ -1168,6 +1213,7 @@ impl Service {
             &self.clean_cancel,
             &mut |done, total| on_progress(CleanProgressDto { done, total }),
         );
+        self.prune(&removed_paths(&report));
         let mut dto = report_dto(&report, false, journal_path);
         dto.refused += problems.len();
         problems.append(&mut dto.problems);
@@ -1342,6 +1388,8 @@ impl Service {
         match result {
             Ok(rec) => {
                 migrate::journal_line(&mut journal, &rec, "done");
+                // 原路径现在是指向别处的链接，扫描不会统计它：从树里去掉。
+                self.prune(&[PathBuf::from(&rec.source)]);
                 Ok(migration_dto(&rec))
             }
             Err(e) => Err(migrate_error(e)),
@@ -1370,6 +1418,7 @@ impl Service {
         })
         .map_err(migrate_error)?;
         migrate::journal_line(&mut journal, &out, "restored");
+        self.graft(Path::new(&out.source));
         Ok(migration_dto(&out))
     }
 
@@ -1384,6 +1433,20 @@ impl Service {
                 estimate: a.estimate(&self.env),
             })
             .collect()
+    }
+
+    /// 系统动作成功后，把它改变的位置同步到扫描树里。
+    fn after_system_action(&self, id: &str) {
+        let Some(drive) = self.env.get("SystemDrive") else {
+            return;
+        };
+        let root = PathBuf::from(format!("{drive}/"));
+        match id {
+            "windows_old" => self.prune(&[root.join("Windows.old")]),
+            "hibernation" => self.prune(&[root.join("hiberfil.sys")]),
+            "recycle_bin" => self.graft(&root.join("$Recycle.Bin")),
+            _ => {}
+        }
     }
 
     pub fn sys_run(&self, id: &str, journal_path: &Path) -> Result<SysResultDto> {
@@ -1404,6 +1467,9 @@ impl Service {
                 "detail": match &result { Ok(o) => o.clone(), Err(e) => format!("{}: {}", e.code, e.detail) },
             })
         );
+        if result.is_ok() {
+            self.after_system_action(action.id);
+        }
         match result {
             Ok(output) => Ok(SysResultDto {
                 id: action.id,
@@ -1635,6 +1701,37 @@ fn leftovers_dto(scan: &LeftoverScan) -> LeftoversDto {
     }
 }
 
+/// 由内存里的扫描树生成摘要（总量、最大文件）。
+fn summarize(state: &ScanState, cancelled: bool) -> ScanSummary {
+    let top_files = scanner::top_files(&state.root_path, &state.root, TOP_FILES)
+        .into_iter()
+        .map(|(p, size)| FileDto {
+            path: display_path(&p),
+            size,
+        })
+        .collect();
+    ScanSummary {
+        method: state.method,
+        fallback: state.fallback,
+        root: display_path(&state.root_path),
+        total_size: state.root.size,
+        file_count: state.root.file_count,
+        skipped: state.skipped,
+        cancelled,
+        top_files,
+    }
+}
+
+/// 报告里真正被删除（或移入回收站）的路径。
+fn removed_paths(report: &Report) -> Vec<PathBuf> {
+    report
+        .entries
+        .iter()
+        .filter(|e| matches!(e.status, Status::Deleted | Status::Recycled))
+        .map(|e| PathBuf::from(&e.path))
+        .collect()
+}
+
 fn open_journal(path: &Path) -> Result<std::fs::File> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| ApiError::with("journal_failed", e))?;
@@ -1755,6 +1852,11 @@ fn validate_selection(
                 "invalid_selection",
                 format!("file {}", s.file),
             ));
+        }
+        if let Some(p) = &s.path {
+            if display_path(&g.files[s.file].path) != *p {
+                return Err(ApiError::with("invalid_selection", format!("stale: {p}")));
+            }
         }
         chosen.entry(s.group).or_default().insert(s.file);
     }
@@ -2149,7 +2251,11 @@ mod tests {
     }
 
     fn selection(group: usize, file: usize) -> DupSelection {
-        DupSelection { group, file }
+        DupSelection {
+            group,
+            file,
+            path: None,
+        }
     }
 
     fn make_dups(d: &Path) {
@@ -3456,5 +3562,329 @@ mod tests {
         assert!(d.join("C/App/main.bin").exists());
         assert_eq!(svc.mig_list().unwrap()[0].status, "failed");
         let _ = CopyStats::default();
+    }
+
+    // ---------- 清理之后立刻反映到已有的扫描结果 ----------
+
+    fn names_at(svc: &Service, parts: &[&str]) -> Vec<String> {
+        svc.children(&parts.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|c| c.name)
+            .collect()
+    }
+
+    #[test]
+    fn deleting_candidates_updates_the_scan_tree_totals_and_top_files() {
+        let d = sandbox();
+        let svc = scanned(&d); // keep/a.bin 10, junk/{big.bin 500, sub/x.bin 50}, repo/...
+        let before = svc.scan_current().unwrap();
+        assert_eq!(before.total_size, 570);
+        assert!(before.top_files.iter().any(|f| f.path.ends_with("big.bin")));
+
+        svc.cand_delete(
+            &[parts(&["junk", "big.bin"])],
+            false,
+            &[],
+            &d.join("j"),
+            &mut |_| {},
+        )
+        .unwrap();
+        let after = svc.scan_current().unwrap();
+        assert_eq!(after.total_size, 70, "500 字节的文件已删除，合计要立刻减少");
+        assert_eq!(after.file_count, before.file_count - 1);
+        assert!(
+            !after.top_files.iter().any(|f| f.path.ends_with("big.bin")),
+            "最大文件列表不能还显示已删除的文件"
+        );
+        assert_eq!(names_at(&svc, &["junk"]), ["sub"]);
+        // 上级目录的大小一起变了。
+        let root = svc.children(&[]).unwrap();
+        assert_eq!(
+            root.items.iter().find(|c| c.name == "junk").unwrap().size,
+            50
+        );
+
+        // 整个目录被删除：它从上级列表里消失。
+        svc.cand_delete(&[parts(&["junk"])], false, &[], &d.join("j"), &mut |_| {})
+            .unwrap();
+        assert!(!names_at(&svc, &[]).contains(&"junk".to_string()));
+        assert_eq!(svc.scan_current().unwrap().total_size, 20);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn refused_or_failed_items_stay_in_the_tree() {
+        let d = sandbox();
+        let svc = scanned(&d);
+        let before = svc.scan_current().unwrap().total_size;
+        // 含 .git 的目录被拒绝，不能从树里消失。
+        svc.cand_delete(&[parts(&["repo"])], false, &[], &d.join("j"), &mut |_| {})
+            .unwrap();
+        assert!(names_at(&svc, &[]).contains(&"repo".to_string()));
+        assert_eq!(svc.scan_current().unwrap().total_size, before);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn running_cleanup_rules_updates_the_scan_tree() {
+        let d = sandbox();
+        write(&d.join("cache/a.bin"), 100);
+        write(&d.join("cache/sub/b.bin"), 20);
+        write(&d.join("keep/k.bin"), 7);
+        let svc = service(&d);
+        svc.scan(d.to_str().unwrap(), &mut |_| {}).unwrap();
+        svc.build_plan(&["r".into()], &[]).unwrap();
+        svc.execute(
+            ExecRequest {
+                dry_run: false,
+                recycle: false,
+            },
+            &d.join("j.jsonl"),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(svc.scan_current().unwrap().total_size, 7);
+        assert!(
+            names_at(&svc, &["cache"]).is_empty(),
+            "规则清掉了 cache 里的内容"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_dry_run_leaves_the_scan_tree_alone() {
+        let d = sandbox();
+        write(&d.join("cache/a.bin"), 100);
+        let svc = service(&d);
+        svc.scan(d.to_str().unwrap(), &mut |_| {}).unwrap();
+        svc.build_plan(&["r".into()], &[]).unwrap();
+        svc.execute(
+            ExecRequest {
+                dry_run: true,
+                recycle: false,
+            },
+            &d.join("j.jsonl"),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(svc.scan_current().unwrap().total_size, 100);
+    }
+
+    #[test]
+    fn deleting_a_file_elsewhere_removes_it_from_duplicate_results_too() {
+        let d = sandbox();
+        make_dups(&d);
+        let svc = dup_service(&d, FakeRunner::scripted(vec![]));
+        svc.scan(d.to_str().unwrap(), &mut |_| {}).unwrap();
+        let before = svc.dup_scan(d.to_str().unwrap(), 1, &mut |_| {}).unwrap();
+        assert_eq!(before.groups[0].files.len(), 3);
+        // 通过"候选清单"删掉其中一份。
+        svc.cand_delete(
+            &[parts(&["b", "two.bin"])],
+            false,
+            &[],
+            &d.join("j"),
+            &mut |_| {},
+        )
+        .unwrap();
+        let after = svc.dup_current().unwrap();
+        assert_eq!(after.groups[0].files.len(), 2, "重复文件视图也要同步");
+        svc.cand_delete(
+            &[parts(&["a", "one.bin"])],
+            false,
+            &[],
+            &d.join("j"),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(
+            svc.dup_current().unwrap().groups.is_empty(),
+            "只剩一份就不再算重复"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn duplicates_deleted_in_the_duplicates_view_update_the_scan_tree() {
+        let d = sandbox();
+        make_dups(&d);
+        let svc = dup_service(&d, FakeRunner::scripted(vec![]));
+        svc.scan(d.to_str().unwrap(), &mut |_| {}).unwrap();
+        let sum = svc.dup_scan(d.to_str().unwrap(), 1, &mut |_| {}).unwrap();
+        let keep = sum.groups[0].keep;
+        let sel: Vec<_> = (0..3)
+            .filter(|i| *i != keep)
+            .map(|i| selection(0, i))
+            .collect();
+        svc.dup_delete(&sel, false, &[], &d.join("j"), &mut |_| {})
+            .unwrap();
+        assert_eq!(
+            svc.scan_current().unwrap().total_size,
+            3000 + 3001,
+            "三份 3000 字节里删了两份"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migrating_removes_the_source_from_the_tree_and_restoring_puts_it_back() {
+        let d = sandbox();
+        make_app_dir(&d);
+        write(&d.join("C/other.bin"), 9);
+        let svc = migration_service(
+            &d,
+            SharedProcs::default(),
+            vec![],
+            FakeRunner::scripted(vec![]),
+            Arc::new(StdMover),
+        );
+        svc.scan(&d.join("C").to_string_lossy(), &mut |_| {})
+            .unwrap();
+        assert_eq!(svc.scan_current().unwrap().total_size, 4309);
+
+        let rec = svc
+            .mig_start(
+                &d.join("C/App").to_string_lossy(),
+                &d.join("D/App").to_string_lossy(),
+                &[],
+                &d.join("j"),
+                &mut |_| {},
+            )
+            .unwrap();
+        // C 盘不再占用这 4300 字节，扫描结果立刻反映。
+        assert_eq!(svc.scan_current().unwrap().total_size, 9);
+        assert!(!names_at(&svc, &[]).contains(&"App".to_string()));
+
+        svc.mig_restore(&rec.id, &d.join("j"), &mut |_| {}).unwrap();
+        assert_eq!(
+            svc.scan_current().unwrap().total_size,
+            4309,
+            "还原后数据回到 C 盘，树里也要回来"
+        );
+        assert!(names_at(&svc, &[]).contains(&"App".to_string()));
+        assert_eq!(names_at(&svc, &["App"]).len(), 2);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn scan_current_requires_a_scan() {
+        let d = sandbox();
+        assert_eq!(service(&d).scan_current().unwrap_err().code, "no_scan");
+    }
+
+    #[test]
+    fn system_actions_update_the_scan_tree_when_they_remove_files() {
+        let d = sandbox();
+        write(&d.join("Windows.old/Windows/x.dll"), 800);
+        write(&d.join("keep.bin"), 5);
+        let reg = Arc::new(MemRegistry::new());
+        let svc = app_service(&d, reg, FakeRunner::scripted(vec![]));
+        svc.scan(d.to_str().unwrap(), &mut |_| {}).unwrap();
+        assert_eq!(svc.scan_current().unwrap().total_size, 805);
+        svc.sys_run("windows_old", &d.join("j")).unwrap();
+        assert_eq!(svc.scan_current().unwrap().total_size, 5);
+        assert!(!names_at(&svc, &[]).contains(&"Windows.old".to_string()));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_stale_selection_is_rejected_instead_of_deleting_a_different_file() {
+        let d = sandbox();
+        make_dups(&d);
+        let svc = dup_service(&d, FakeRunner::scripted(vec![]));
+        let sum = svc.dup_scan(d.to_str().unwrap(), 1, &mut |_| {}).unwrap();
+        let keep = sum.groups[0].keep;
+        let victim = (0..3).find(|i| *i != keep).unwrap();
+        let other = (0..3).find(|i| *i != keep && *i != victim).unwrap();
+        // 界面看到的第 victim 项其实是别的文件（序号已错位）：路径对不上就拒绝。
+        let stale = DupSelection {
+            group: 0,
+            file: victim,
+            path: Some(sum.groups[0].files[other].path.clone()),
+        };
+        let err = svc
+            .dup_delete(&[stale], false, &[], &d.join("j"), &mut |_| {})
+            .unwrap_err();
+        assert_eq!(err.code, "invalid_selection");
+        assert!(
+            d.join("a/one.bin").exists()
+                && d.join("b/two.bin").exists()
+                && d.join("c/three.bin").exists()
+        );
+        // 路径一致时正常删除。
+        let ok = DupSelection {
+            group: 0,
+            file: victim,
+            path: Some(sum.groups[0].files[victim].path.clone()),
+        };
+        assert_eq!(
+            svc.dup_delete(&[ok], false, &[], &d.join("j"), &mut |_| {})
+                .unwrap()
+                .deleted,
+            1
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn unicode_names_survive_scan_candidates_deletion_and_refresh() {
+        let d = sandbox();
+        write(
+            &d.join("资料库/二级目录 📁/公司年度总结（未剪辑）📹.mp4"),
+            900,
+        );
+        write(&d.join("资料库/二级目录 📁/日本語.txt"), 10);
+        write(&d.join("下载/한국어.bin"), 5);
+        let svc = dup_service(&d, FakeRunner::scripted(vec![]));
+        let sum = svc.scan(d.to_str().unwrap(), &mut |_| {}).unwrap();
+        assert!(
+            sum.top_files[0]
+                .path
+                .ends_with("公司年度总结（未剪辑）📹.mp4"),
+            "最大文件的路径原样返回"
+        );
+        let names = names_at(&svc, &["资料库", "二级目录 📁"]);
+        assert_eq!(names, ["公司年度总结（未剪辑）📹.mp4", "日本語.txt"]);
+
+        let resolved = svc
+            .cand_resolve(&[parts(&["资料库", "二级目录 📁", "日本語.txt"])])
+            .unwrap();
+        assert!(resolved[0].path.ends_with("资料库/二级目录 📁/日本語.txt") && resolved[0].exists);
+
+        let rep = svc
+            .cand_delete(
+                &[parts(&[
+                    "资料库",
+                    "二级目录 📁",
+                    "公司年度总结（未剪辑）📹.mp4",
+                ])],
+                false,
+                &[],
+                &d.join("日志.jsonl"),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!((rep.deleted, rep.freed_bytes), (1, 900));
+        // 日志是合法 UTF-8，中文原样可读。
+        let journal = fs::read_to_string(d.join("日志.jsonl")).unwrap();
+        assert!(
+            journal.contains("公司年度总结（未剪辑）📹.mp4"),
+            "{journal}"
+        );
+        // 刷新后的树和摘要立刻反映，名字没有变样。
+        assert_eq!(names_at(&svc, &["资料库", "二级目录 📁"]), ["日本語.txt"]);
+        assert_eq!(svc.scan_current().unwrap().total_size, 15);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn display_path_leaves_unicode_untouched() {
+        assert_eq!(
+            display_path(Path::new(r"\\?\D:\项目\报告📄.docx")),
+            r"D:\项目\报告📄.docx"
+        );
     }
 }

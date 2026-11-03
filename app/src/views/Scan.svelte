@@ -10,6 +10,8 @@
   import Icon from '../components/Icon.svelte';
   import { iconKind } from '../lib/fileicon';
   import { clearCands } from '../lib/candidates.svelte';
+  import { refresh } from '../lib/refresh.svelte';
+  import { resetTree } from '../lib/tree.svelte';
   import type { Child, ScanProgress, ScanSummary } from '../lib/types';
 
   let path = $state(nav.scanPath);
@@ -21,6 +23,7 @@
   let error = $state('');
   let view = $state<'list' | 'map'>('list');
   let mapParts = $state<string[]>([]);
+  let treeVersion = $state(0);
 
   async function start() {
     if (scanning || !path.trim()) return;
@@ -30,6 +33,7 @@
     progress = null;
     mapParts = [];
     clearCands(); // 新扫描会使旧的路径分量失效
+    resetTree();
     const unlisten = await api.onScanProgress((p) => (progress = p));
     try {
       summary = await api.scanStart(path.trim());
@@ -43,6 +47,26 @@
       scanning = false;
     }
   }
+
+  // 清理、迁移之后直接用后端已更新的扫描结果刷新，不需要重新扫描。
+  let lastRefresh = refresh.scan;
+  $effect(() => {
+    const v = refresh.scan;
+    if (v === lastRefresh) return;
+    lastRefresh = v;
+    if (!summary || scanning) return;
+    (async () => {
+      try {
+        summary = await api.scanCurrent();
+        const c = await api.scanChildren([]);
+        rootItems = c.items;
+        rootHidden = c.hidden;
+        treeVersion++;
+      } catch {
+        /* 没有扫描结果（比如已被新的扫描替换）时忽略 */
+      }
+    })();
+  });
 
   // 由概览页触发的"分析此盘"。
   let lastRequest = nav.scanRequest;
@@ -104,9 +128,11 @@
     <section class="card">
       <h2>{t('scan.tree')}</h2>
       <ul class="tree">
-        {#each rootItems as c (c.name)}
-          <TreeNode item={c} parentParts={[]} parentSize={summary.total_size} />
-        {/each}
+        {#key treeVersion}
+          {#each rootItems as c (c.name)}
+            <TreeNode item={c} parentParts={[]} parentSize={summary.total_size} />
+          {/each}
+        {/key}
       </ul>
       {#if rootHidden > 0}<p class="muted small">{t('scan.hidden', { n: rootHidden })}</p>{/if}
     </section>

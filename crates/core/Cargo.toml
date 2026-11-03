@@ -14,8 +14,9 @@ sysinfo = { version = "0.40.1", default-features = false, features = ["system", 
 trash = "5.2.9"
 
 [dev-dependencies]
+encoding_rs = "0.8.44"
 flate2 = "1.1.10"
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_RestartManager", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_RestartManager", "Win32_Storage_FileSystem", "Win32_Globalization"] }
 winreg = "0.56.0"

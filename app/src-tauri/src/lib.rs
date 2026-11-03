@@ -209,6 +209,11 @@ async fn scan_start(
 }
 
 #[tauri::command]
+fn scan_current(state: State<'_, AppState>) -> Result<ScanSummary, ApiError> {
+    state.svc.scan_current()
+}
+
+#[tauri::command]
 fn scan_cancel(state: State<'_, AppState>) {
     state.svc.cancel_scan();
 }
@@ -548,6 +553,7 @@ pub fn run() {
             list_drives,
             scan_start,
             scan_cancel,
+            scan_current,
             scan_children,
             reveal_in_explorer,
             rules_list,

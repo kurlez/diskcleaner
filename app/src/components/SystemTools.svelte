@@ -3,6 +3,7 @@
   import { api } from '../lib/api';
   import { formatSize } from '../lib/format';
   import { errorText, t } from '../lib/i18n.svelte';
+  import { afterChange } from '../lib/refresh.svelte';
   import type { SysAction } from '../lib/types';
 
   let actions = $state<SysAction[] | null>(null);
@@ -33,6 +34,7 @@
       const gained = r.free_before !== null && r.free_after !== null ? r.free_after - r.free_before : 0;
       results[id] = { ok: true, text: gained > 0 ? t('sys.freed', { size: formatSize(gained) }) : t('sys.doneNoChange') };
       open = null;
+      afterChange();
       await load();
     } catch (e) {
       results[id] = { ok: false, text: errorText(e) };

@@ -64,8 +64,8 @@ impl CommandRunner for SystemRunner {
         let out = cmd.output()?;
         Ok(CmdOutput {
             code: out.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            stdout: decode_console(&out.stdout),
+            stderr: decode_console(&out.stderr),
         })
     }
 
@@ -80,10 +80,70 @@ impl CommandRunner for SystemRunner {
         let out = cmd.output()?;
         Ok(CmdOutput {
             code: out.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            stdout: decode_console(&out.stdout),
+            stderr: decode_console(&out.stderr),
         })
     }
+}
+
+// ---------- 外部程序输出的解码 ----------
+
+/// 解码外部程序的输出，避免中文变成乱码。
+///
+/// Windows 自带工具（`taskkill`、`sc`、`mklink`、`DISM`……）通过管道输出时用的是控制台的 OEM 代码页
+/// （中文系统是 GBK/936），不是 UTF-8。所以：能按 UTF-8 解就按 UTF-8；否则按系统 OEM 代码页解码。
+pub fn decode_console(bytes: &[u8]) -> String {
+    decode_console_with(bytes, &decode_oem)
+}
+
+/// 与 [`decode_console`] 相同，但允许注入"旧代码页解码器"，便于在任何平台上测试。
+pub fn decode_console_with(bytes: &[u8], legacy: &dyn Fn(&[u8]) -> String) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => legacy(bytes),
+    }
+}
+
+/// 按系统 OEM 代码页解码（Windows）。其他平台没有这个概念，退回有损 UTF-8。
+#[cfg(windows)]
+fn decode_oem(bytes: &[u8]) -> String {
+    use windows_sys::Win32::Globalization::MultiByteToWideChar;
+    const CP_OEMCP: u32 = 1;
+    if bytes.is_empty() || bytes.len() > i32::MAX as usize {
+        return String::new();
+    }
+    // SAFETY: 两次调用都只读 `bytes`；第二次的输出缓冲区大小来自第一次的返回值。
+    unsafe {
+        let n = MultiByteToWideChar(
+            CP_OEMCP,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            std::ptr::null_mut(),
+            0,
+        );
+        if n <= 0 {
+            return String::from_utf8_lossy(bytes).into_owned();
+        }
+        let mut wide = vec![0u16; n as usize];
+        let m = MultiByteToWideChar(
+            CP_OEMCP,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            wide.as_mut_ptr(),
+            n,
+        );
+        if m <= 0 {
+            return String::from_utf8_lossy(bytes).into_owned();
+        }
+        String::from_utf16_lossy(&wide[..m as usize])
+    }
+}
+
+#[cfg(not(windows))]
+fn decode_oem(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 // ---------- 服务控制 ----------
@@ -705,6 +765,59 @@ mod tests {
                 .unwrap()
                 .estimate(&Env::default()),
             None
+        );
+    }
+
+    // ----- 输出解码 -----
+
+    /// 用 encoding_rs 的 GBK 充当"系统 OEM 代码页"。
+    fn gbk(bytes: &[u8]) -> String {
+        encoding_rs::GBK.decode(bytes).0.into_owned()
+    }
+
+    #[test]
+    fn utf8_output_is_kept_as_is() {
+        let text = "ERROR: 拒绝访问。 Access is denied. 📄 ünïcödé";
+        assert_eq!(decode_console_with(text.as_bytes(), &gbk), text);
+        assert_eq!(
+            decode_console_with(b"plain ascii 123", &gbk),
+            "plain ascii 123"
+        );
+        assert_eq!(decode_console_with(b"", &gbk), "");
+    }
+
+    #[test]
+    fn gbk_console_output_is_decoded_instead_of_turning_into_garbage() {
+        // "错误: 拒绝访问。" 的 GBK 编码，按 UTF-8 解会得到乱码。
+        let (bytes, _, _) = encoding_rs::GBK.encode("错误: 拒绝访问。 (os error 5)");
+        assert!(
+            std::str::from_utf8(&bytes).is_err(),
+            "测试数据必须不是合法 UTF-8"
+        );
+        let lossy = String::from_utf8_lossy(&bytes);
+        assert!(lossy.contains('\u{FFFD}'), "旧做法确实会乱码");
+        assert_eq!(
+            decode_console_with(&bytes, &gbk),
+            "错误: 拒绝访问。 (os error 5)"
+        );
+    }
+
+    #[test]
+    fn mixed_ascii_and_gbk_is_decoded_as_a_whole() {
+        let (bytes, _, _) = encoding_rs::GBK.encode("SUCCESS: 已终止进程 \"foo.exe\"，PID 1234。");
+        assert_eq!(
+            decode_console_with(&bytes, &gbk),
+            "SUCCESS: 已终止进程 \"foo.exe\"，PID 1234。"
+        );
+    }
+
+    #[test]
+    fn the_default_decoder_never_panics_on_arbitrary_bytes() {
+        let noise: Vec<u8> = (0..=255u8).collect();
+        let _ = decode_console(&noise);
+        assert_eq!(
+            decode_console("正常 UTF-8 文本".as_bytes()),
+            "正常 UTF-8 文本"
         );
     }
 }

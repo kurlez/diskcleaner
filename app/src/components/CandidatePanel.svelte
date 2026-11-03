@@ -1,6 +1,7 @@
 <script lang="ts">
   import { api } from '../lib/api';
-  import { analyze } from '../lib/candidates';
+  import { analyze, isInside } from '../lib/candidates';
+  import { afterChange } from '../lib/refresh.svelte';
   import { cands, clearCands, removeCand } from '../lib/candidates.svelte';
   import { formatSize } from '../lib/format';
   import { iconKind } from '../lib/fileicon';
@@ -36,9 +37,17 @@
     busy = true;
     error = '';
     try {
-      report = await api.candDelete(info.effective.map((c) => c.parts), recycle);
-      clearCands();
+      const items = info.effective;
+      // 先取一份最新的真实路径，之后才能知道哪些项目没处理成功。
+      const paths = (await api.candResolve(items.map((c) => c.parts))).map((r) => r.path);
+      report = await api.candDelete(items.map((c) => c.parts), recycle);
+      // 只移出已经处理掉的项；被拒绝或失败的留在清单里，让用户看到并决定。
+      const failed = new Set(report.problems.map((p) => p.path));
+      const stay = items.filter((_, i) => failed.has(paths[i]));
+      cands.items = cands.items.filter((c) => stay.some((k) => k.key === c.key || isInside(c.parts, k.parts)));
+      if (cands.items.length === 0) cands.open = false;
       confirmed = false;
+      afterChange(); // 树、合计、最大文件、概览、重复文件立刻刷新
     } catch (e) {
       error = errorText(e);
     } finally {

@@ -24,8 +24,48 @@ const tree: Record<string, Child[]> = {
   ],
 };
 
+
+const TOP_FILES_ALL = [
+    { path: 'C:\\Users\\alice\\Videos\\holiday-2025.mp4', size: 18 * GB },
+    { path: 'C:\\pagefile.sys', size: 6 * GB },
+    { path: 'C:\\Users\\alice\\AppData\\Local\\Docker\\wsl\\data\\ext4.vhdx', size: 5 * GB + 300 * MB },
+    { path: 'C:\\Windows\\SoftwareDistribution\\Download\\a1b2.cab', size: 1 * GB + 80 * MB },
+    { path: 'D:\\SynologyDrive\\_IQLIBRARY\\Projects\\2024\\Quarterly Reports\\Raw Footage\\Camera A\\Day 03\\Takes\\INTERVIEW_MAIN_CAMERA_4K_PRORES_422_HQ_FINAL_v7.mov', size: 2.4 * GB },
+    { path: 'D:\\Wechat Files\\xwechat_files\\wxid_8a3k2f9d_f21c\\msg\\attach\\2024-08\\Rec\\公司年度总结大会现场录像_高清完整版（未剪辑）📹.mp4', size: 807.9 * MB },
+    { path: 'D:\\EGLIBRARY\\WLIU-LIBRARY.library\\images\\LK3X9A2B7QD.info\\VID_20240815_093012_original_recording.mp4', size: 891 * MB },
+  ];
+
+/** 由当前（可能已被清理修改过的）模拟数据生成扫描摘要。 */
+function buildSummary(cancelled: boolean) {
+  return {
+    method: 'mft' as const, fallback: null,
+    root: mockRoot, total_size: mockTotal, file_count: 852_000, skipped: 37, cancelled,
+    top_files: TOP_FILES_ALL.filter((f) => !removedPaths.has(f.path)),
+  };
+}
+
+/** 从模拟目录树里删掉一个节点，并同步所有上级的大小与总量。 */
+function removeFromMock(parts: string[]) {
+  const parentKey = parts.slice(0, -1).join('\u0000');
+  const list = tree[parentKey];
+  const hit = list?.find((c) => c.name.toLowerCase() === parts[parts.length - 1].toLowerCase());
+  if (!list || !hit) return 0;
+  tree[parentKey] = list.filter((c) => c !== hit);
+  for (let i = parts.length - 1; i > 0; i--) {
+    const pk = parts.slice(0, i - 1).join('\u0000');
+    const anc = tree[pk]?.find((c) => c.name === parts[i - 1]);
+    if (anc) anc.size = Math.max(0, anc.size - hit.size);
+  }
+  mockTotal = Math.max(0, mockTotal - hit.size);
+  removedPaths.add(['C:', ...parts].join('\\'));
+  return hit.size;
+}
+
 let exclusions: string[] = ['D:\\Projects\\keep'];
 let cancelScan = false;
+let mockTotal = 312 * GB;
+let mockRoot = 'C:\\';
+const removedPaths = new Set<string>();
 let cancelClean = false;
 const listeners = { scan: new Set<(p: ScanProgress) => void>(), clean: new Set<(p: CleanProgress) => void>(), dup: new Set<(p: DupProgress) => void>() };
 let cancelDup = false;
@@ -102,20 +142,13 @@ export const mockApi: Api = {
       files += 21_000;
       listeners.scan.forEach((cb) => cb({ files, dirs: i * 1900, bytes: i * 14 * GB }));
     }
-    return {
-      method: 'mft', fallback: null,
-      root: path, total_size: 312 * GB, file_count: 852_000, skipped: 37, cancelled: cancelScan,
-      top_files: [
-        { path: 'C:\\Users\\alice\\Videos\\holiday-2025.mp4', size: 18 * GB },
-        { path: 'C:\\pagefile.sys', size: 6 * GB },
-        { path: 'C:\\Users\\alice\\AppData\\Local\\Docker\\wsl\\data\\ext4.vhdx', size: 5 * GB + 300 * MB },
-        { path: 'C:\\Windows\\SoftwareDistribution\\Download\\a1b2.cab', size: 1 * GB + 80 * MB },
-        { path: 'D:\\SynologyDrive\\_IQLIBRARY\\Projects\\2024\\Quarterly Reports\\Raw Footage\\Camera A\\Day 03\\Takes\\INTERVIEW_MAIN_CAMERA_4K_PRORES_422_HQ_FINAL_v7.mov', size: 2.4 * GB },
-        { path: 'D:\\EGLIBRARY\\WLIU-LIBRARY.library\\images\\LK3X9A2B7QD.info\\VID_20240815_093012_original_recording.mp4', size: 891 * MB },
-      ],
-    };
+    mockRoot = path;
+    mockTotal = 312 * GB;
+    removedPaths.clear();
+    return buildSummary(false);
   },
   async scanCancel() { cancelScan = true; },
+  async scanCurrent() { return buildSummary(false); },
   async scanChildren(parts) {
     await sleep(80);
     return { items: tree[parts.join('\u0000')] ?? [], hidden: 0 };
@@ -267,6 +300,7 @@ export const mockApi: Api = {
   },
   async candDelete(items, recycle) {
     await sleep(600);
+    items.forEach((parts) => removeFromMock(parts));
     return {
       dry_run: false, freed_bytes: recycle ? 0 : items.length * 150 * MB, recycled_bytes: recycle ? items.length * 150 * MB : 0,
       deleted: recycle ? 0 : items.length, recycled: recycle ? items.length : 0, would_delete: 0,

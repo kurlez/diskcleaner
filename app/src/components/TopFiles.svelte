@@ -4,7 +4,7 @@
   import { iconKind } from '../lib/fileicon';
   import { t } from '../lib/i18n.svelte';
   import { hasCand, toggleCand } from '../lib/candidates.svelte';
-  import { breakableName, breakablePath, relParts, splitPath } from '../lib/path';
+  import { nameSegments, pathSegments, relParts, splitPath } from '../lib/path';
   import type { FileEntry } from '../lib/types';
   import Icon from './Icon.svelte';
 
@@ -35,8 +35,8 @@
     <li>
       <span class="size num">{formatSize(f.size)}</span>
       <div class="body" title={f.path}>
-        <div class="fname"><Icon kind={iconKind(f.name, false)} size={16} /><strong>{breakableName(f.name)}</strong></div>
-        <div class="dir mono">{breakablePath(f.dir)}</div>
+        <div class="fname"><Icon kind={iconKind(f.name, false)} size={16} /><strong>{#each nameSegments(f.name) as seg}{seg}<wbr />{/each}</strong></div>
+        <div class="dir mono">{#each pathSegments(f.dir) as seg}{seg}<wbr />{/each}</div>
       </div>
       <div class="acts">
         {#if f.parts}

@@ -8,6 +8,7 @@ const real: Api = {
   listDrives: () => invoke('list_drives'),
   scanStart: (path) => invoke('scan_start', { path }),
   scanCancel: () => invoke('scan_cancel'),
+  scanCurrent: () => invoke('scan_current'),
   scanChildren: (parts) => invoke('scan_children', { parts }),
   reveal: (parts) => invoke('reveal_in_explorer', { parts }),
   rulesList: () => invoke('rules_list'),

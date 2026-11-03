@@ -5,6 +5,7 @@
   import { errorText, i18n, t } from '../lib/i18n.svelte';
   import { cleanPath, driveOf, parseSpace, suggestTarget } from '../lib/migrate';
   import { nav } from '../lib/nav.svelte';
+  import { afterChange } from '../lib/refresh.svelte';
   import Icon from '../components/Icon.svelte';
   import type { Blocker, Blockers, Drive, MigIssue, MigPreflight, MigProgress, Migration, StopResult } from '../lib/types';
 
@@ -140,6 +141,7 @@
     const un = await api.onMigProgress((p) => (progress = p));
     try {
       done = await api.migStart(cleanPath(source), cleanPath(target));
+      afterChange(); // C 盘空间立刻释放，树和概览同步
       await loadHistory();
     } catch (e) {
       const code = (e as { code?: string })?.code;
@@ -162,6 +164,7 @@
     const un = await api.onMigProgress((p) => (progress = p));
     try {
       await api.migRestore(m.id);
+      afterChange();
     } catch (e) {
       error = errorText(e);
     } finally {

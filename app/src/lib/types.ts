@@ -37,7 +37,7 @@ export interface DupSummary {
   scanned_files: number; errors: number; cancelled: boolean;
 }
 export interface DupProgress { phase: 'walking' | 'partial' | 'full'; done: number; total: number }
-export interface DupSelection { group: number; file: number }
+export interface DupSelection { group: number; file: number; path?: string }
 
 export interface SysAction { id: string; risk: Risk; estimate: number | null }
 export interface SysResult { id: string; free_before: number | null; free_after: number | null; output: string }
@@ -86,6 +86,7 @@ export interface Api {
   listDrives(): Promise<Drive[]>;
   scanStart(path: string): Promise<ScanSummary>;
   scanCancel(): Promise<void>;
+  scanCurrent(): Promise<ScanSummary>;
   scanChildren(parts: string[]): Promise<Children>;
   reveal(parts: string[]): Promise<void>;
   rulesList(): Promise<Rule[]>;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { breakableName, breakablePath, relParts, splitPath } from './path';
+import { nameSegments, pathSegments, relParts, splitPath } from './path';
 
 describe('splitPath', () => {
   it('separates the directory from the file name', () => {
@@ -25,6 +25,17 @@ describe('splitPath', () => {
   });
 });
 
+describe('unicode paths', () => {
+  it('splits Chinese, Japanese, Korean and emoji paths without damaging them', () => {
+    expect(splitPath('D:\\资料库\\二级目录 📁\\公司年度总结（未剪辑）📹.mp4')).toEqual({
+      dir: 'D:\\资料库\\二级目录 📁',
+      name: '公司年度总结（未剪辑）📹.mp4',
+    });
+    expect(splitPath('C:\\ユーザー\\한국어.txt')).toEqual({ dir: 'C:\\ユーザー', name: '한국어.txt' });
+    expect(relParts('D:\\资料库', 'd:\\资料库\\二级目录 📁\\日本語.txt')).toEqual(['二级目录 📁', '日本語.txt']);
+  });
+});
+
 describe('relParts', () => {
   it('returns the components below the scan root', () => {
     expect(relParts('C:\\', 'C:\\Users\\a\\x.bin')).toEqual(['Users', 'a', 'x.bin']);
@@ -39,13 +50,23 @@ describe('relParts', () => {
   });
 });
 
-describe('breakable display helpers', () => {
-  it('add break opportunities without changing the visible text', () => {
-    const strip = (x: string) => x.replace(/\u200b/g, '');
-    expect(strip(breakablePath('C:\\Users\\alice\\Videos'))).toBe('C:\\Users\\alice\\Videos');
-    expect(breakablePath('C:\\a\\b')).toBe('C:\\\u200ba\\\u200bb');
-    expect(strip(breakableName('VID_2024-08.original.mp4'))).toBe('VID_2024-08.original.mp4');
-    expect(breakableName('a_b')).toBe('a_\u200bb');
-    expect(breakablePath('')).toBe('');
+describe('display segments', () => {
+  it('split after separators and join back to exactly the original text', () => {
+    for (const path of ['C:\\Users\\alice\\Videos', 'D:\\', '/home/a/b', 'plain', '', '\\\\?\\C:\\x\\', 'D:\\项目\\报告📄 终稿\\']) {
+      expect(pathSegments(path).join('')).toBe(path);
+    }
+    expect(pathSegments('C:\\a\\b')).toEqual(['C:\\', 'a\\', 'b']);
+  });
+
+  it('never inserts invisible characters', () => {
+    const joined = pathSegments('C:\\Users\\alice\\Videos').join('') + nameSegments('a_b-c.d').join('');
+    expect(/[\u200b\u200c\u200d\ufeff\u00ad]/.test(joined)).toBe(false);
+  });
+
+  it('splits file names after _ - and . and rejoins losslessly', () => {
+    expect(nameSegments('pagefile.sys')).toEqual(['pagefile.', 'sys']);
+    for (const n of ['VID_2024-08.original.mp4', '微信图片_20240815.jpg', '📄 notes-v2.txt', 'noext', '']) {
+      expect(nameSegments(n).join('')).toBe(n);
+    }
   });
 });

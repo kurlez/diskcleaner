@@ -243,6 +243,95 @@ fn collect(path: &Path, node: &Node, n: usize, heap: &mut BinaryHeap<Reverse<(u6
     }
 }
 
+// ---------- 就地更新扫描树 ----------
+//
+// 清理、迁移之后，已有的扫描结果会过期。与其让用户重新扫描整个磁盘，
+// 不如直接在内存里的树上删掉/替换对应的节点，并同步修正所有上级目录的大小和排序。
+
+fn same_name(a: &str, b: &str) -> bool {
+    a == b || a.to_lowercase() == b.to_lowercase()
+}
+
+fn resort(node: &mut Node) {
+    node.children
+        .sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
+}
+
+/// 把 `path` 拆成相对扫描根 `root_path` 的目录名序列（不区分大小写、兼容 `\` 与 `/`）。
+/// 路径就是根本身时返回空序列；不在根之内返回 `None`。
+pub fn parts_below(root_path: &Path, path: &Path) -> Option<Vec<String>> {
+    let comps = |p: &Path| -> Vec<String> {
+        p.to_string_lossy()
+            .replace('\\', "/")
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let (r, p) = (comps(root_path), comps(path));
+    if p.len() < r.len() || !r.iter().zip(&p).all(|(a, b)| same_name(a, b)) {
+        return None;
+    }
+    Some(p[r.len()..].to_vec())
+}
+
+/// 删除 `parts` 指向的节点，并从沿途所有上级扣除它的大小与文件数。返回被删节点的 (大小, 文件数)。
+pub fn remove_path(node: &mut Node, parts: &[String]) -> Option<(u64, u64)> {
+    let (first, rest) = parts.split_first()?;
+    let idx = node
+        .children
+        .iter()
+        .position(|c| same_name(&c.name, first))?;
+    let removed = if rest.is_empty() {
+        let c = node.children.remove(idx);
+        (c.size, c.file_count)
+    } else {
+        remove_path(&mut node.children[idx], rest)?
+    };
+    node.size = node.size.saturating_sub(removed.0);
+    node.file_count = node.file_count.saturating_sub(removed.1);
+    resort(node);
+    Some(removed)
+}
+
+/// 用 `new` 替换 `parts` 指向的节点（不存在则插入），并按大小差修正所有上级。
+/// 中间的目录必须已存在，否则返回 `false` 且树保持不变。
+pub fn replace_path(node: &mut Node, parts: &[String], mut new: Node) -> bool {
+    let Some((first, rest)) = parts.split_first() else {
+        return false;
+    };
+    let idx = node.children.iter().position(|c| same_name(&c.name, first));
+    if rest.is_empty() {
+        let (old_size, old_files) = match idx {
+            Some(i) => {
+                new.name = node.children[i].name.clone();
+                let o = (node.children[i].size, node.children[i].file_count);
+                node.children[i] = new.clone();
+                o
+            }
+            None => {
+                new.name = first.clone();
+                node.children.push(new.clone());
+                (0, 0)
+            }
+        };
+        node.size = node.size.saturating_sub(old_size) + new.size;
+        node.file_count = node.file_count.saturating_sub(old_files) + new.file_count;
+        resort(node);
+        return true;
+    }
+    let Some(i) = idx else { return false };
+    let (before_size, before_files) = (node.children[i].size, node.children[i].file_count);
+    if !replace_path(&mut node.children[i], rest, new) {
+        return false;
+    }
+    let (after_size, after_files) = (node.children[i].size, node.children[i].file_count);
+    node.size = node.size.saturating_sub(before_size) + after_size;
+    node.file_count = node.file_count.saturating_sub(before_files) + after_files;
+    resort(node);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +436,137 @@ mod tests {
         assert!(scan(&d.join("f"), &AtomicBool::new(false), &mut |_| {}).is_err());
         assert!(scan(&d.join("missing"), &AtomicBool::new(false), &mut |_| {}).is_err());
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    // ----- 就地更新 -----
+
+    fn n(name: &str, size: u64, children: Vec<Node>) -> Node {
+        let is_dir = !children.is_empty() || size == 0;
+        Node {
+            name: name.into(),
+            is_dir,
+            size: if children.is_empty() {
+                size
+            } else {
+                children.iter().map(|c| c.size).sum()
+            },
+            file_count: if children.is_empty() {
+                u64::from(!is_dir)
+            } else {
+                children.iter().map(|c| c.file_count).sum()
+            },
+            children,
+        }
+    }
+
+    fn sample() -> Node {
+        let mut root = n(
+            "root",
+            0,
+            vec![
+                n(
+                    "Users",
+                    0,
+                    vec![
+                        n(
+                            "alice",
+                            0,
+                            vec![n("big.bin", 500, vec![]), n("small.txt", 5, vec![])],
+                        ),
+                        n("bob", 0, vec![n("b.dat", 100, vec![])]),
+                    ],
+                ),
+                n("pagefile.sys", 300, vec![]),
+            ],
+        );
+        root.children.iter_mut().for_each(|_| {});
+        resort(&mut root);
+        root
+    }
+
+    fn p(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn splits_paths_below_the_scan_root_ignoring_case_and_separator_style() {
+        let root = Path::new("C:\\Users");
+        assert_eq!(
+            parts_below(root, Path::new("c:/users/Alice/x.bin")),
+            Some(p(&["Alice", "x.bin"]))
+        );
+        assert_eq!(parts_below(root, Path::new("C:\\USERS")), Some(vec![]));
+        assert_eq!(parts_below(root, Path::new("C:\\Usersx\\a")), None);
+        assert_eq!(parts_below(root, Path::new("D:\\Users\\a")), None);
+        // 中文与表情符号的名字原样保留。
+        assert_eq!(
+            parts_below(Path::new("D:\\"), Path::new("D:\\项目\\报告📄.docx")),
+            Some(p(&["项目", "报告📄.docx"]))
+        );
+    }
+
+    #[test]
+    fn removing_a_node_updates_every_ancestor_and_the_sort_order() {
+        let mut t = sample();
+        assert_eq!(t.size, 905);
+        let removed = remove_path(&mut t, &p(&["users", "ALICE", "big.bin"])).unwrap();
+        assert_eq!(removed, (500, 1));
+        assert_eq!(t.size, 405);
+        assert_eq!(t.file_count, 3);
+        let users = t.children.iter().find(|c| c.name == "Users").unwrap();
+        assert_eq!(users.size, 105);
+        // 缩小之后 Users 不再是最大的，排序要跟着变。
+        assert_eq!(t.children[0].name, "pagefile.sys");
+        assert!(remove_path(&mut t, &p(&["Users", "ghost"])).is_none());
+        assert!(remove_path(&mut t, &[]).is_none());
+        assert_eq!(t.size, 405, "找不到时树不变");
+    }
+
+    #[test]
+    fn removing_a_whole_directory_subtracts_its_total() {
+        let mut t = sample();
+        assert_eq!(remove_path(&mut t, &p(&["Users", "alice"])), Some((505, 2)));
+        assert_eq!(t.size, 400);
+        assert_eq!(
+            t.children
+                .iter()
+                .find(|c| c.name == "Users")
+                .unwrap()
+                .children
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn replacing_a_subtree_adjusts_sizes_by_the_difference() {
+        let mut t = sample();
+        let fresh = n("whatever", 0, vec![n("only.bin", 40, vec![])]);
+        assert!(replace_path(&mut t, &p(&["Users", "alice"]), fresh));
+        let alice = &t
+            .children
+            .iter()
+            .find(|c| c.name == "Users")
+            .unwrap()
+            .children
+            .iter()
+            .find(|c| c.name == "alice")
+            .unwrap();
+        assert_eq!((alice.size, alice.file_count), (40, 1));
+        assert_eq!(t.size, 440, "905 - 505 + 40");
+        assert!(
+            replace_path(
+                &mut t,
+                &p(&["Users", "carol"]),
+                n("x", 0, vec![n("c.bin", 10, vec![])])
+            ),
+            "不存在时插入"
+        );
+        assert_eq!(t.size, 450);
+        assert!(
+            !replace_path(&mut t, &p(&["Nope", "x"]), n("x", 1, vec![])),
+            "中间目录不存在时失败"
+        );
+        assert_eq!(t.size, 450);
     }
 }

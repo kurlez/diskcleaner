@@ -2,6 +2,7 @@
   import { api } from '../lib/api';
   import { formatSize, percent } from '../lib/format';
   import { errorText, i18n, t } from '../lib/i18n.svelte';
+  import { afterChange, refresh } from '../lib/refresh.svelte';
   import Icon from '../components/Icon.svelte';
   import { iconKind } from '../lib/fileicon';
   import type { DupGroup, DupProgress, DupSummary, Report } from '../lib/types';
@@ -72,19 +73,38 @@
     error = '';
     const sel = [...selected].map((k) => {
       const [group, file] = k.split(':').map(Number);
-      return { group, file };
+      // 同时回传路径：别处的清理让序号错位时，后端会拒绝而不是删到别的文件。
+      const path = summary!.groups.find((g) => g.id === group)?.files[file]?.path;
+      return { group, file, path };
     });
     try {
       report = await api.dupDelete(sel, recycle);
       summary = await api.dupCurrent();
       selected = suggested(summary.groups);
       confirmed = false;
+      afterChange();
     } catch (e) {
       error = errorText(e);
     } finally {
       deleting = false;
     }
   }
+
+  // 别处（候选清单、迁移……）清理了文件：立即重新读取，并把选择恢复成推荐值。
+  let lastDups = refresh.dups;
+  $effect(() => {
+    if (refresh.dups === lastDups) return;
+    lastDups = refresh.dups;
+    if (!summary || scanning || deleting) return;
+    api
+      .dupCurrent()
+      .then((s) => {
+        summary = s;
+        selected = suggested(s.groups);
+        confirmed = false;
+      })
+      .catch(() => {});
+  });
 
   const date = (secs: number) => new Date(secs * 1000).toLocaleDateString(i18n.locale === 'zh' ? 'zh-CN' : 'en-US');
 </script>

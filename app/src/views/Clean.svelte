@@ -3,6 +3,7 @@
   import { api } from '../lib/api';
   import { formatSize, percent } from '../lib/format';
   import { errorText, t } from '../lib/i18n.svelte';
+  import { afterChange } from '../lib/refresh.svelte';
   import SystemTools from '../components/SystemTools.svelte';
   import type { CleanProgress, PlanSummary, Report, Rule } from '../lib/types';
 
@@ -64,6 +65,7 @@
     try {
       report = await api.planExecute(dryRun, recycle);
       step = 'report';
+      if (!dryRun) afterChange();
     } catch (e) {
       error = errorText(e);
       step = 'select';

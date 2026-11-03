@@ -4,6 +4,8 @@
   import { errorText, t } from '../lib/i18n.svelte';
   import { iconKind } from '../lib/fileicon';
   import { hasCand, toggleCand } from '../lib/candidates.svelte';
+  import { isExpanded, setExpanded } from '../lib/tree.svelte';
+  import { onMount } from 'svelte';
   import Icon from './Icon.svelte';
   import type { Child } from '../lib/types';
   import TreeNode from './TreeNode.svelte';
@@ -21,22 +23,34 @@
   const picked = $derived(hasCand(parts));
   const kind = $derived(iconKind(item.name, item.is_dir));
 
+  async function load() {
+    loading = true;
+    error = '';
+    try {
+      kids = await api.scanChildren(parts);
+    } catch (e) {
+      error = errorText(e);
+      open = false;
+      setExpanded(parts, false);
+    } finally {
+      loading = false;
+    }
+  }
+
   async function toggle() {
     if (!item.is_dir) return;
     open = !open;
-    if (open && !kids) {
-      loading = true;
-      error = '';
-      try {
-        kids = await api.scanChildren(parts);
-      } catch (e) {
-        error = errorText(e);
-        open = false;
-      } finally {
-        loading = false;
-      }
-    }
+    setExpanded(parts, open);
+    if (open && !kids) await load();
   }
+
+  // 刷新后节点会被重新创建；之前展开过的目录自动展开并重新取数据。
+  onMount(() => {
+    if (isExpanded(parts) && item.is_dir) {
+      open = true;
+      load();
+    }
+  });
 </script>
 
 <li>
