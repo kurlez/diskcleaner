@@ -8,13 +8,15 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use diskclean_core::cleaner::{execute, ExecOptions, Status};
-use diskclean_core::plan::{build_plan, Plan, PlanSkipReason};
+use diskclean_core::cleaner::{execute_with, ExecOptions, Report, Status};
+use diskclean_core::duplicates::{self, DupGroup, DupOptions, DupOutcome, DupPhase};
+use diskclean_core::plan::{build_plan, Candidate, Plan, PlanSkipReason};
 use diskclean_core::rules::{Disposal, Env, Risk, Rule};
 use diskclean_core::safety::SafetyPolicy;
 use diskclean_core::scanner::{self, Node, Progress, ScanOutcome};
+use diskclean_core::sysaction::{self, CommandRunner, ScServices, SystemRunner};
 use serde::Serialize;
 
 const MAX_CHILDREN: usize = 1000;
@@ -157,7 +159,68 @@ pub struct ReportDto {
     pub refused: usize,
     pub cancelled: bool,
     pub problems: Vec<Problem>,
+    /// 停止/恢复 Windows 服务时遇到的问题。
+    pub service_errors: Vec<String>,
     pub journal_path: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DupFileDto {
+    pub path: String,
+    pub modified: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DupGroupDto {
+    /// 在后端保存的结果里的序号；删除时前端只回传序号，不回传路径。
+    pub id: usize,
+    pub size: u64,
+    pub wasted: u64,
+    /// 推荐保留的文件下标。
+    pub keep: usize,
+    pub files: Vec<DupFileDto>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DupSummary {
+    pub groups: Vec<DupGroupDto>,
+    /// 因数量上限未返回的组数。
+    pub hidden_groups: usize,
+    pub total_wasted: u64,
+    pub scanned_files: u64,
+    pub errors: u64,
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct DupProgressDto {
+    /// `walking` / `partial` / `full`
+    pub phase: &'static str,
+    pub done: u64,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+pub struct DupSelection {
+    pub group: usize,
+    pub file: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SysActionDto {
+    pub id: &'static str,
+    pub risk: Risk,
+    /// 预计释放的字节数；无法估算时为空。
+    pub estimate: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SysResultDto {
+    pub id: &'static str,
+    /// 系统盘可用空间的变化（执行前后），无法获取时为空。
+    pub free_before: Option<u64>,
+    pub free_after: Option<u64>,
+    pub output: String,
 }
 
 #[derive(Debug, Serialize, Clone, Copy)]
@@ -200,12 +263,17 @@ struct ScanState {
 pub struct Service {
     rules: Vec<Rule>,
     env: Env,
-    policy_factory: Box<PolicyFactory>,
+    policy_factory: Arc<PolicyFactory>,
+    /// 用户亲自选中文件时使用的策略（如删除重复文件）。
+    selected_policy_factory: Arc<PolicyFactory>,
+    runner: Arc<dyn CommandRunner>,
     fast_scan: Option<Box<FastScanFn>>,
     scan: Mutex<Option<ScanState>>,
     plan: Mutex<Option<Plan>>,
+    dup: Mutex<Option<DupOutcome>>,
     scan_cancel: Arc<AtomicBool>,
     clean_cancel: Arc<AtomicBool>,
+    dup_cancel: Arc<AtomicBool>,
 }
 
 impl Service {
@@ -215,16 +283,32 @@ impl Service {
         policy_factory: Box<PolicyFactory>,
         fast_scan: Option<Box<FastScanFn>>,
     ) -> Self {
+        let policy_factory: Arc<PolicyFactory> = Arc::from(policy_factory);
         Self {
             rules,
             env,
+            selected_policy_factory: policy_factory.clone(),
             policy_factory,
+            runner: Arc::new(SystemRunner),
             fast_scan,
             scan: Mutex::new(None),
             plan: Mutex::new(None),
+            dup: Mutex::new(None),
             scan_cancel: Arc::new(AtomicBool::new(false)),
             clean_cancel: Arc::new(AtomicBool::new(false)),
+            dup_cancel: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// 替换外部命令执行器与"用户选中文件"策略（生产环境与测试各自注入）。
+    pub fn with_system(
+        mut self,
+        runner: Arc<dyn CommandRunner>,
+        selected_policy_factory: Box<PolicyFactory>,
+    ) -> Self {
+        self.runner = runner;
+        self.selected_policy_factory = Arc::from(selected_policy_factory);
+        self
     }
 
     pub fn drives(&self) -> Vec<DriveDto> {
@@ -456,58 +540,333 @@ impl Service {
             .take()
             .ok_or(ApiError::new("no_plan"))?;
         self.clean_cancel.store(false, Ordering::Relaxed);
-
-        if let Some(dir) = journal_path.parent() {
-            fs::create_dir_all(dir).map_err(|e| ApiError::with("journal_failed", e))?;
-        }
-        let mut journal = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(journal_path)
-            .map_err(|e| ApiError::with("journal_failed", e))?;
-
+        let mut journal = open_journal(journal_path)?;
         let opts = ExecOptions {
             dry_run: req.dry_run,
             override_disposal: req.recycle.then_some(Disposal::Recycle),
         };
-        let report = execute(
+        let services = ScServices::new(self.runner.as_ref());
+        let report = execute_with(
             &plan,
             opts,
             Some(&mut journal as &mut dyn Write),
+            Some(&services),
+            &self.clean_cancel,
+            &mut |done, total| on_progress(CleanProgressDto { done, total }),
+        );
+        Ok(report_dto(&report, req.dry_run, journal_path))
+    }
+
+    // ----- 重复文件 -----
+
+    pub fn dup_scan(
+        &self,
+        path: &str,
+        min_size: u64,
+        on_progress: &mut dyn FnMut(DupProgressDto),
+    ) -> Result<DupSummary> {
+        let root = PathBuf::from(path);
+        if path.trim().is_empty() || !root.is_dir() {
+            return Err(ApiError::with("invalid_path", path));
+        }
+        self.dup_cancel.store(false, Ordering::Relaxed);
+        let opts = DupOptions {
+            min_size,
+            ..DupOptions::default()
+        };
+        let out = duplicates::find_duplicates(&root, &opts, &self.dup_cancel, &mut |p| {
+            on_progress(DupProgressDto {
+                phase: match p.phase {
+                    DupPhase::Walking => "walking",
+                    DupPhase::PartialHash => "partial",
+                    DupPhase::FullHash => "full",
+                },
+                done: p.done,
+                total: p.total,
+            })
+        })
+        .map_err(|e| ApiError::with("scan_failed", e))?;
+        let summary = dup_summary(&out);
+        *self.dup.lock().unwrap() = Some(out);
+        Ok(summary)
+    }
+
+    pub fn cancel_dup(&self) {
+        self.dup_cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// 删除用户勾选的重复文件。
+    ///
+    /// 前端只传 (组序号, 文件序号)；路径取自后端保存的扫描结果。删除前逐项确认：
+    /// * 每组至少保留一份，且保留的那份仍在、没有变化；
+    /// * 被删文件的大小和修改时间与扫描时一致。
+    ///
+    /// 任何一项不满足就整体拒绝，不会删除任何文件。
+    pub fn dup_delete(
+        &self,
+        selections: &[DupSelection],
+        recycle: bool,
+        exclusions: &[String],
+        journal_path: &Path,
+        on_progress: &mut dyn FnMut(CleanProgressDto),
+    ) -> Result<ReportDto> {
+        let candidates = {
+            let guard = self.dup.lock().unwrap();
+            let out = guard.as_ref().ok_or(ApiError::new("no_scan"))?;
+            validate_selection(out, selections, recycle)?
+        };
+        let policy = (self.selected_policy_factory)(exclusions)?;
+        let plan = Plan::from_items(candidates, policy);
+        self.clean_cancel.store(false, Ordering::Relaxed);
+        let mut journal = open_journal(journal_path)?;
+        let report = execute_with(
+            &plan,
+            ExecOptions::default(),
+            Some(&mut journal as &mut dyn Write),
+            None,
             &self.clean_cancel,
             &mut |done, total| on_progress(CleanProgressDto { done, total }),
         );
 
-        let mut problems = Vec::new();
-        for e in &report.entries {
-            let (status, detail) = match &e.status {
-                Status::Failed(d) => ("failed", d.clone()),
-                Status::Refused(d) => ("refused", d.clone()),
-                _ => continue,
-            };
-            if problems.len() < MAX_PROBLEMS {
-                problems.push(Problem {
-                    rule_id: e.rule_id.clone(),
-                    path: display_path(Path::new(&e.path)),
-                    status,
-                    detail,
-                });
+        // 已经删除（或进了回收站）的文件从保存的结果里移除，界面刷新后不会再看到它们。
+        let gone: std::collections::HashSet<&str> = report
+            .entries
+            .iter()
+            .filter(|e| matches!(e.status, Status::Deleted | Status::Recycled))
+            .map(|e| e.path.as_str())
+            .collect();
+        if let Some(out) = self.dup.lock().unwrap().as_mut() {
+            for g in &mut out.groups {
+                g.files
+                    .retain(|f| !gone.contains(f.path.to_string_lossy().as_ref()));
             }
+            out.groups.retain(|g| g.files.len() > 1);
         }
-        Ok(ReportDto {
-            dry_run: req.dry_run,
-            freed_bytes: report.freed_bytes,
-            recycled_bytes: report.recycled_bytes,
-            deleted: report.count(|s| matches!(s, Status::Deleted)),
-            recycled: report.count(|s| matches!(s, Status::Recycled)),
-            would_delete: report.count(|s| matches!(s, Status::WouldDelete)),
-            failed: report.failed(),
-            refused: report.refused(),
-            cancelled: report.cancelled,
-            problems,
-            journal_path: display_path(journal_path),
-        })
+        Ok(report_dto(&report, false, journal_path))
     }
+
+    /// 返回当前保存的重复文件结果（删除后用于刷新界面）。
+    pub fn dup_current(&self) -> Result<DupSummary> {
+        let guard = self.dup.lock().unwrap();
+        guard
+            .as_ref()
+            .map(dup_summary)
+            .ok_or(ApiError::new("no_scan"))
+    }
+
+    // ----- 系统动作 -----
+
+    pub fn sys_list(&self) -> Vec<SysActionDto> {
+        sysaction::SYSTEM_ACTIONS
+            .iter()
+            .map(|a| SysActionDto {
+                id: a.id,
+                risk: a.risk,
+                estimate: a.estimate(&self.env),
+            })
+            .collect()
+    }
+
+    pub fn sys_run(&self, id: &str, journal_path: &Path) -> Result<SysResultDto> {
+        let action =
+            sysaction::find_action(id).ok_or_else(|| ApiError::with("unknown_action", id))?;
+        let mut journal = open_journal(journal_path)?;
+        let before = free_space(&self.env);
+        let result = action.run(&self.env, self.runner.as_ref());
+        let after = free_space(&self.env);
+        let _ = writeln!(
+            journal,
+            "{}",
+            serde_json::json!({
+                "op": "system",
+                "ts": SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()),
+                "action": action.id,
+                "ok": result.is_ok(),
+                "detail": match &result { Ok(o) => o.clone(), Err(e) => format!("{}: {}", e.code, e.detail) },
+            })
+        );
+        match result {
+            Ok(output) => Ok(SysResultDto {
+                id: action.id,
+                free_before: before,
+                free_after: after,
+                output,
+            }),
+            Err(e) => Err(ApiError::with(
+                "sys_failed",
+                format!("{}: {}", e.code, e.detail),
+            )),
+        }
+    }
+}
+
+fn open_journal(path: &Path) -> Result<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| ApiError::with("journal_failed", e))?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| ApiError::with("journal_failed", e))
+}
+
+fn report_dto(report: &Report, dry_run: bool, journal_path: &Path) -> ReportDto {
+    let mut problems = Vec::new();
+    for e in &report.entries {
+        let (status, detail) = match &e.status {
+            Status::Failed(d) => ("failed", d.clone()),
+            Status::Refused(d) => ("refused", d.clone()),
+            _ => continue,
+        };
+        if problems.len() < MAX_PROBLEMS {
+            problems.push(Problem {
+                rule_id: e.rule_id.clone(),
+                path: display_path(Path::new(&e.path)),
+                status,
+                detail,
+            });
+        }
+    }
+    ReportDto {
+        dry_run,
+        freed_bytes: report.freed_bytes,
+        recycled_bytes: report.recycled_bytes,
+        deleted: report.count(|s| matches!(s, Status::Deleted)),
+        recycled: report.count(|s| matches!(s, Status::Recycled)),
+        would_delete: report.count(|s| matches!(s, Status::WouldDelete)),
+        failed: report.failed(),
+        refused: report.refused(),
+        cancelled: report.cancelled,
+        problems,
+        service_errors: report.service_errors.clone(),
+        journal_path: display_path(journal_path),
+    }
+}
+
+/// 系统盘的可用空间。`SystemDrive` 形如 `C:`；匹配不到时返回 `None`。
+fn free_space(env: &Env) -> Option<u64> {
+    let drive = env.get("SystemDrive")?.to_lowercase();
+    sysinfo::Disks::new_with_refreshed_list()
+        .list()
+        .iter()
+        .find(|d| {
+            d.mount_point()
+                .to_string_lossy()
+                .to_lowercase()
+                .starts_with(&drive)
+        })
+        .map(|d| d.available_space())
+}
+
+const MAX_DUP_GROUPS: usize = 500;
+
+fn dup_summary(out: &DupOutcome) -> DupSummary {
+    let groups = out
+        .groups
+        .iter()
+        .enumerate()
+        .take(MAX_DUP_GROUPS)
+        .map(|(id, g)| DupGroupDto {
+            id,
+            size: g.size,
+            wasted: g.wasted(),
+            keep: g.suggested_keep(),
+            files: g
+                .files
+                .iter()
+                .map(|f| DupFileDto {
+                    path: display_path(&f.path),
+                    modified: f.modified,
+                })
+                .collect(),
+        })
+        .collect();
+    DupSummary {
+        groups,
+        hidden_groups: out.groups.len().saturating_sub(MAX_DUP_GROUPS),
+        total_wasted: out.groups.iter().map(DupGroup::wasted).sum(),
+        scanned_files: out.scanned_files,
+        errors: out.errors,
+        cancelled: out.cancelled,
+    }
+}
+
+fn mtime_secs(m: &fs::Metadata) -> u64 {
+    m.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs())
+}
+
+/// 校验用户的选择并生成待删除清单。任何一项不合格都整体拒绝。
+fn validate_selection(
+    out: &DupOutcome,
+    sel: &[DupSelection],
+    recycle: bool,
+) -> Result<Vec<Candidate>> {
+    if sel.is_empty() {
+        return Err(ApiError::new("nothing_selected"));
+    }
+    let mut chosen: std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>> =
+        Default::default();
+    for s in sel {
+        let g = out
+            .groups
+            .get(s.group)
+            .ok_or_else(|| ApiError::with("invalid_selection", format!("group {}", s.group)))?;
+        if s.file >= g.files.len() {
+            return Err(ApiError::with(
+                "invalid_selection",
+                format!("file {}", s.file),
+            ));
+        }
+        chosen.entry(s.group).or_default().insert(s.file);
+    }
+
+    let unchanged = |g: &DupGroup, i: usize| -> bool {
+        let f = &g.files[i];
+        fs::symlink_metadata(&f.path)
+            .map(|m| m.is_file() && m.len() == g.size && mtime_secs(&m) == f.modified)
+            .unwrap_or(false)
+    };
+
+    let disposal = if recycle {
+        Disposal::Recycle
+    } else {
+        Disposal::Permanent
+    };
+    let mut items = Vec::new();
+    for (gi, files) in &chosen {
+        let g = &out.groups[*gi];
+        // 至少保留一份，并且保留的那份必须仍然存在、没有变化——否则"重复"这个前提已经不成立。
+        let keeper = (0..g.files.len()).find(|i| !files.contains(i) && unchanged(g, *i));
+        if keeper.is_none() {
+            let code = if files.len() >= g.files.len() {
+                "must_keep_one"
+            } else {
+                "keeper_changed"
+            };
+            return Err(ApiError::with(code, display_path(&g.files[0].path)));
+        }
+        for &fi in files {
+            if !unchanged(g, fi) {
+                return Err(ApiError::with(
+                    "changed_since_scan",
+                    display_path(&g.files[fi].path),
+                ));
+            }
+            items.push(Candidate {
+                rule_id: "duplicates".into(),
+                path: g.files[fi].path.clone(),
+                is_dir: false,
+                size: g.size,
+                file_count: 1,
+                disposal,
+            });
+        }
+    }
+    Ok(items)
 }
 
 fn skip_counts(plan: &Plan) -> Vec<SkipCount> {
@@ -557,6 +916,7 @@ mod tests {
             risk: Risk::Low,
             default_selected: true,
             disposal: Disposal::Permanent,
+            services: vec![],
             targets: vec![Target {
                 path: "%BASE%/cache".into(),
                 kind: TargetKind::Contents,
@@ -795,5 +1155,346 @@ mod tests {
     fn display_path_strips_extended_prefix() {
         assert_eq!(display_path(Path::new(r"\\?\C:\Users\a")), r"C:\Users\a");
         assert_eq!(display_path(Path::new("/tmp/x")), "/tmp/x");
+    }
+
+    // ---------- 重复文件 / 系统动作 / 服务停启 ----------
+
+    use diskclean_core::sysaction::CmdOutput;
+    use std::collections::VecDeque;
+
+    #[derive(Default)]
+    struct FakeRunner {
+        calls: Mutex<Vec<String>>,
+        script: Mutex<VecDeque<CmdOutput>>,
+    }
+
+    impl FakeRunner {
+        fn scripted(v: Vec<CmdOutput>) -> Arc<Self> {
+            Arc::new(FakeRunner {
+                calls: Mutex::default(),
+                script: Mutex::new(v.into()),
+            })
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl CommandRunner for FakeRunner {
+        fn run(&self, program: &str, args: &[&str]) -> std::io::Result<CmdOutput> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{program} {}", args.join(" ")));
+            Ok(self.script.lock().unwrap().pop_front().unwrap_or_default())
+        }
+    }
+
+    fn posix_factory(base: &Path, protect_sub: Option<&str>) -> Box<PolicyFactory> {
+        let base_s = base.to_string_lossy().into_owned();
+        let sub = protect_sub.map(|s| base.join(s).to_string_lossy().into_owned());
+        Box::new(move |excl: &[String]| {
+            let mut p = SafetyPolicy::empty(PathStyle::Posix);
+            if let Some(sub) = &sub {
+                p.protect(sub).map_err(|e| ApiError::with("policy", e))?;
+            } else {
+                let _ = &base_s;
+            }
+            for x in excl {
+                p.exclude(x)
+                    .map_err(|e| ApiError::with("invalid_exclusion", e))?;
+            }
+            Ok(p)
+        })
+    }
+
+    /// 用户选中文件策略：只保护 `locked` 子目录。
+    fn dup_service(base: &Path, runner: Arc<FakeRunner>) -> Service {
+        service(base).with_system(runner, posix_factory(base, Some("locked")))
+    }
+
+    fn selection(group: usize, file: usize) -> DupSelection {
+        DupSelection { group, file }
+    }
+
+    fn make_dups(d: &Path) {
+        write(&d.join("a/one.bin"), 3000);
+        write(&d.join("b/two.bin"), 3000);
+        write(&d.join("c/three.bin"), 3000);
+        write(&d.join("c/unique.bin"), 3001);
+    }
+
+    fn dup_names(sum: &DupSummary, g: usize) -> Vec<String> {
+        sum.groups[g]
+            .files
+            .iter()
+            .map(|f| {
+                Path::new(&f.path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dup_scan_delete_and_refresh() {
+        let d = sandbox();
+        make_dups(&d);
+        let svc = dup_service(&d, FakeRunner::scripted(vec![]));
+        let sum = svc.dup_scan(d.to_str().unwrap(), 1, &mut |_| {}).unwrap();
+        assert_eq!(sum.groups.len(), 1);
+        assert_eq!(sum.total_wasted, 6000);
+        assert_eq!(dup_names(&sum, 0), ["one.bin", "two.bin", "three.bin"]);
+        let keep = sum.groups[0].keep;
+
+        // 删除除推荐保留项之外的所有文件。
+        let sel: Vec<_> = (0..3)
+            .filter(|i| *i != keep)
+            .map(|i| selection(0, i))
+            .collect();
+        let journal = d.join("j.jsonl");
+        let rep = svc
+            .dup_delete(&sel, false, &[], &journal, &mut |_| {})
+            .unwrap();
+        assert_eq!((rep.deleted, rep.failed, rep.refused), (2, 0, 0));
+        assert_eq!(rep.freed_bytes, 6000);
+        let remaining = [
+            d.join("a/one.bin"),
+            d.join("b/two.bin"),
+            d.join("c/three.bin"),
+        ]
+        .iter()
+        .filter(|p| p.exists())
+        .count();
+        assert_eq!(remaining, 1);
+        assert!(d.join("c/unique.bin").exists());
+        assert!(fs::read_to_string(&journal)
+            .unwrap()
+            .contains("\"duplicates\""));
+
+        // 刷新后这一组已不存在。
+        assert!(svc.dup_current().unwrap().groups.is_empty());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn selecting_every_copy_is_rejected_and_nothing_is_deleted() {
+        let d = sandbox();
+        make_dups(&d);
+        let svc = dup_service(&d, FakeRunner::scripted(vec![]));
+        svc.dup_scan(d.to_str().unwrap(), 1, &mut |_| {}).unwrap();
+        let all: Vec<_> = (0..3).map(|i| selection(0, i)).collect();
+        let err = svc
+            .dup_delete(&all, false, &[], &d.join("j"), &mut |_| {})
+            .unwrap_err();
+        assert_eq!(err.code, "must_keep_one");
+        assert!(
+            d.join("a/one.bin").exists()
+                && d.join("b/two.bin").exists()
+                && d.join("c/three.bin").exists()
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_file_changed_after_scanning_blocks_the_whole_deletion() {
+        let d = sandbox();
+        make_dups(&d);
+        let svc = dup_service(&d, FakeRunner::scripted(vec![]));
+        let sum = svc.dup_scan(d.to_str().unwrap(), 1, &mut |_| {}).unwrap();
+        let names = dup_names(&sum, 0);
+        let idx = |n: &str| names.iter().position(|x| x == n).unwrap();
+
+        // 选中 one 和 two，保留 three；扫描后 two 被改动。
+        write(&d.join("b/two.bin"), 4096);
+        let sel = [selection(0, idx("one.bin")), selection(0, idx("two.bin"))];
+        let err = svc
+            .dup_delete(&sel, false, &[], &d.join("j"), &mut |_| {})
+            .unwrap_err();
+        assert_eq!(err.code, "changed_since_scan");
+        assert!(
+            d.join("a/one.bin").exists(),
+            "未改动的 one 也不能被删：整体拒绝"
+        );
+
+        // 被保留的那份被改动：同样拒绝。
+        write(&d.join("c/three.bin"), 100);
+        let err = svc
+            .dup_delete(
+                &[selection(0, idx("one.bin"))],
+                false,
+                &[],
+                &d.join("j"),
+                &mut |_| {},
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "keeper_changed");
+        assert!(d.join("a/one.bin").exists());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn invalid_or_empty_selections_are_rejected() {
+        let d = sandbox();
+        make_dups(&d);
+        let svc = dup_service(&d, FakeRunner::scripted(vec![]));
+        assert_eq!(
+            svc.dup_delete(&[selection(0, 0)], false, &[], &d.join("j"), &mut |_| {})
+                .unwrap_err()
+                .code,
+            "no_scan"
+        );
+        svc.dup_scan(d.to_str().unwrap(), 1, &mut |_| {}).unwrap();
+        for bad in [selection(5, 0), selection(0, 9)] {
+            assert_eq!(
+                svc.dup_delete(&[bad], false, &[], &d.join("j"), &mut |_| {})
+                    .unwrap_err()
+                    .code,
+                "invalid_selection"
+            );
+        }
+        assert_eq!(
+            svc.dup_delete(&[], false, &[], &d.join("j"), &mut |_| {})
+                .unwrap_err()
+                .code,
+            "nothing_selected"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn protected_locations_are_refused_by_the_selected_file_policy() {
+        let d = sandbox();
+        write(&d.join("locked/secret.bin"), 3000);
+        write(&d.join("open/copy.bin"), 3000);
+        let svc = dup_service(&d, FakeRunner::scripted(vec![]));
+        let sum = svc.dup_scan(d.to_str().unwrap(), 1, &mut |_| {}).unwrap();
+        let names = dup_names(&sum, 0);
+        let locked = names.iter().position(|n| n == "secret.bin").unwrap();
+        // 保留 copy.bin，请求删除受保护目录里的 secret.bin。
+        let rep = svc
+            .dup_delete(
+                &[selection(0, locked)],
+                false,
+                &[],
+                &d.join("j"),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!((rep.deleted, rep.refused), (0, 1));
+        assert!(d.join("locked/secret.bin").exists());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn user_exclusions_protect_duplicates_too() {
+        let d = sandbox();
+        make_dups(&d);
+        let svc = dup_service(&d, FakeRunner::scripted(vec![]));
+        let sum = svc.dup_scan(d.to_str().unwrap(), 1, &mut |_| {}).unwrap();
+        let names = dup_names(&sum, 0);
+        let i = names.iter().position(|n| n == "one.bin").unwrap();
+        let excl = [d.join("a").to_string_lossy().into_owned()];
+        let rep = svc
+            .dup_delete(&[selection(0, i)], false, &excl, &d.join("j"), &mut |_| {})
+            .unwrap();
+        assert_eq!(rep.refused, 1);
+        assert!(d.join("a/one.bin").exists());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn dup_scan_rejects_bad_paths() {
+        let d = sandbox();
+        let svc = dup_service(&d, FakeRunner::scripted(vec![]));
+        assert_eq!(
+            svc.dup_scan("/no/such/dir", 1, &mut |_| {})
+                .unwrap_err()
+                .code,
+            "invalid_path"
+        );
+        assert_eq!(svc.dup_current().unwrap_err().code, "no_scan");
+    }
+
+    #[test]
+    fn system_action_runs_the_tool_logs_it_and_reports_failures() {
+        let d = sandbox();
+        let env_dir = d.to_string_lossy().into_owned();
+        let runner = FakeRunner::scripted(vec![
+            CmdOutput::default(),
+            CmdOutput {
+                code: 5,
+                stdout: String::new(),
+                stderr: "Access is denied.".into(),
+            },
+        ]);
+        let base = service(&d).with_system(runner.clone(), posix_factory(&d, None));
+        let svc = Service::new(
+            base.rules.clone(),
+            Env::from_pairs([("SystemDrive", env_dir.as_str())]),
+            posix_factory(&d, None),
+            None,
+        )
+        .with_system(runner.clone(), posix_factory(&d, None));
+
+        let journal = d.join("sys.jsonl");
+        let ok = svc.sys_run("hibernation", &journal).unwrap();
+        assert_eq!(ok.id, "hibernation");
+        let err = svc.sys_run("component_store", &journal).unwrap_err();
+        assert_eq!(err.code, "sys_failed");
+        assert!(err.detail.unwrap().contains("Access is denied"));
+        assert_eq!(
+            svc.sys_run("format_c", &journal).unwrap_err().code,
+            "unknown_action"
+        );
+
+        assert_eq!(runner.calls().len(), 2, "未知动作不能触发任何命令");
+        let log = fs::read_to_string(&journal).unwrap();
+        assert_eq!(log.lines().count(), 2);
+        assert!(log.contains("\"ok\":true") && log.contains("\"ok\":false"));
+
+        let list = svc.sys_list();
+        assert_eq!(list.len(), 5);
+        assert!(list
+            .iter()
+            .any(|a| a.id == "windows_old" && a.risk == Risk::High));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn executing_a_rule_with_services_stops_then_restores_them() {
+        let d = sandbox();
+        write(&d.join("cache/a.bin"), 100);
+        let running = |n: u32, name: &str| CmdOutput {
+            code: 0,
+            stdout: format!("        STATE              : {n}  {name}\n"),
+            stderr: String::new(),
+        };
+        let runner = FakeRunner::scripted(vec![
+            running(4, "RUNNING"), // query
+            CmdOutput::default(),  // stop
+            running(1, "STOPPED"), // 轮询
+            CmdOutput::default(),  // start
+        ]);
+        let mut svc = service(&d).with_system(runner.clone(), posix_factory(&d, None));
+        svc.rules[0].services = vec!["wuauserv".into()];
+        svc.build_plan(&["r".into()], &[]).unwrap();
+        let rep = svc
+            .execute(
+                ExecRequest {
+                    dry_run: false,
+                    recycle: false,
+                },
+                &d.join("j.jsonl"),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(rep.freed_bytes, 100);
+        assert!(rep.service_errors.is_empty());
+        assert_eq!(runner.calls().last().unwrap(), "sc.exe start wuauserv");
+        assert_eq!(runner.calls()[1], "sc.exe stop wuauserv");
+        fs::remove_dir_all(&d).unwrap();
     }
 }

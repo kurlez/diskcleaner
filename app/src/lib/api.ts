@@ -17,6 +17,13 @@ const real: Api = {
   cleanCancel: () => invoke('clean_cancel'),
   settingsGet: () => invoke('settings_get'),
   settingsSetExclusions: (exclusions) => invoke('settings_set_exclusions', { exclusions }),
+  dupScan: (path, minSizeMb) => invoke('dup_scan', { path, minSizeMb }),
+  dupCancel: () => invoke('dup_cancel'),
+  dupCurrent: () => invoke('dup_current'),
+  dupDelete: (selections, recycle) => invoke('dup_delete', { selections, recycle }),
+  sysList: () => invoke('sys_list'),
+  sysRun: (id) => invoke('sys_run', { id }),
+  onDupProgress: (cb) => listen<never>('dup-progress', (e) => cb(e.payload)),
   onScanProgress: (cb) => listen<never>('scan-progress', (e) => cb(e.payload)),
   onCleanProgress: (cb) => listen<never>('clean-progress', (e) => cb(e.payload)),
 };

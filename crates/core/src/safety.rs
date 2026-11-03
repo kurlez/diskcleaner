@@ -261,6 +261,37 @@ impl SafetyPolicy {
         Ok(p)
     }
 
+    /// 用户亲自选中具体文件时使用的策略（如删除重复文件）。
+    ///
+    /// 与 [`SafetyPolicy::new`] 的区别：不保护用户自己的文档、桌面、下载等目录——
+    /// 那些文件正是用户明确要处理的对象；但系统目录、程序目录、回收站内部、
+    /// 应用数据（`AppData`）仍然一律拒绝。`.git`、`.ssh` 等受保护名称规则照常生效。
+    pub fn for_user_selected(dirs: &KnownDirs) -> Result<Self, Denied> {
+        let mut p = SafetyPolicy::empty(PathStyle::Windows);
+        for d in [
+            &dirs.system_root,
+            &dirs.program_files,
+            &dirs.program_files_x86,
+            &dirs.program_data,
+        ] {
+            p.protect(d)?;
+        }
+        let drive = NormPath::parse(&dirs.system_root, PathStyle::Windows)?.0[0].clone();
+        for special in [
+            "System Volume Information",
+            "$Recycle.Bin",
+            "Recovery",
+            "Boot",
+        ] {
+            p.protect(&format!("{drive}\\{special}"))?;
+        }
+        p.protect(&format!(
+            "{}\\AppData",
+            dirs.user_profile.trim_end_matches('\\')
+        ))?;
+        Ok(p)
+    }
+
     /// 不带任何默认保护的空策略（仅用于测试或自行配置）。
     pub fn empty(style: PathStyle) -> Self {
         SafetyPolicy {
@@ -475,6 +506,43 @@ mod tests {
         assert!(p.check_delete(r"D:\cache\keep\x").is_err());
         // 删除 D:\cache 本身会连带删掉 keep
         assert!(p.check_delete(r"D:\cache").is_err());
+    }
+}
+
+#[cfg(test)]
+mod user_selected_tests {
+    use super::*;
+
+    #[test]
+    fn user_files_are_allowed_but_system_and_app_data_are_not() {
+        let p = SafetyPolicy::for_user_selected(&KnownDirs::typical("alice")).unwrap();
+        for ok in [
+            r"C:\Users\alice\Documents\old\copy (1).docx",
+            r"C:\Users\alice\Downloads\movie.mkv",
+            r"C:\Users\alice\Desktop\a.txt",
+            r"D:\Backup\photo.jpg",
+        ] {
+            assert!(p.check_delete(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            r"C:\Windows\System32\kernel32.dll",
+            r"C:\Program Files\App\a.dll",
+            r"C:\ProgramData\x",
+            r"C:\Users\alice\AppData\Roaming\app\settings.json",
+            r"C:\$Recycle.Bin\S-1\x",
+            r"C:\Users\alice\Documents\repo\.git\config",
+        ] {
+            assert!(p.check_delete(bad).is_err(), "{bad}");
+        }
+        // 用户排除项依旧优先。
+        let mut q = p.clone();
+        q.exclude(r"C:\Users\alice\Documents\keep").unwrap();
+        assert!(q
+            .check_delete(r"C:\Users\alice\Documents\keep\a.txt")
+            .is_err());
+        assert!(q
+            .check_delete(r"C:\Users\alice\Documents\other\a.txt")
+            .is_ok());
     }
 }
 

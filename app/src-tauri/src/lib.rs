@@ -10,8 +10,8 @@ use diskclean_core::safety::{KnownDirs, SafetyPolicy};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use service::{
-    ApiError, ChildrenDto, DriveDto, ExecRequest, PlanSummary, ReportDto, RuleDto, ScanSummary,
-    Service,
+    ApiError, ChildrenDto, DriveDto, DupSelection, DupSummary, ExecRequest, PlanSummary, ReportDto,
+    RuleDto, ScanSummary, Service, SysActionDto, SysResultDto,
 };
 use settings::Settings;
 
@@ -58,16 +58,31 @@ fn fast_scan() -> Option<Box<service::FastScanFn>> {
     None
 }
 
-/// 生产环境的安全策略：Windows 默认保护名单 + 用户排除项。
-fn windows_policy(exclusions: &[String]) -> Result<SafetyPolicy, ApiError> {
-    let dirs = KnownDirs::from_env().ok_or(ApiError::new("unsupported_platform"))?;
-    let mut policy = SafetyPolicy::new(&dirs).map_err(|e| ApiError::with("policy", e))?;
+/// 把用户排除项加进策略；排除项无效时给出带路径的错误。
+fn with_exclusions(
+    mut policy: SafetyPolicy,
+    exclusions: &[String],
+) -> Result<SafetyPolicy, ApiError> {
     for x in exclusions {
         policy
             .exclude(x)
             .map_err(|e| ApiError::with("invalid_exclusion", format!("{x}: {e}")))?;
     }
     Ok(policy)
+}
+
+/// 生产环境的安全策略：Windows 默认保护名单 + 用户排除项。
+fn windows_policy(exclusions: &[String]) -> Result<SafetyPolicy, ApiError> {
+    let dirs = KnownDirs::from_env().ok_or(ApiError::new("unsupported_platform"))?;
+    let policy = SafetyPolicy::new(&dirs).map_err(|e| ApiError::with("policy", e))?;
+    with_exclusions(policy, exclusions)
+}
+
+/// 用户亲自选中文件时的策略（删除重复文件）：不保护用户文档，但系统和 AppData 仍受保护。
+fn windows_selected_policy(exclusions: &[String]) -> Result<SafetyPolicy, ApiError> {
+    let dirs = KnownDirs::from_env().ok_or(ApiError::new("unsupported_platform"))?;
+    let policy = SafetyPolicy::for_user_selected(&dirs).map_err(|e| ApiError::with("policy", e))?;
+    with_exclusions(policy, exclusions)
 }
 
 async fn blocking<T, F>(f: F) -> Result<T, ApiError>
@@ -175,6 +190,63 @@ fn clean_cancel(state: State<'_, AppState>) {
 }
 
 #[tauri::command]
+async fn dup_scan(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+    min_size_mb: u64,
+) -> Result<DupSummary, ApiError> {
+    let svc = state.svc.clone();
+    blocking(move || {
+        svc.dup_scan(&path, min_size_mb.saturating_mul(1024 * 1024), &mut |p| {
+            let _ = app.emit("dup-progress", p);
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+fn dup_cancel(state: State<'_, AppState>) {
+    state.svc.cancel_dup();
+}
+
+#[tauri::command]
+fn dup_current(state: State<'_, AppState>) -> Result<DupSummary, ApiError> {
+    state.svc.dup_current()
+}
+
+#[tauri::command]
+async fn dup_delete(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    selections: Vec<DupSelection>,
+    recycle: bool,
+) -> Result<ReportDto, ApiError> {
+    let svc = state.svc.clone();
+    let journal = state.journal_path.clone();
+    let exclusions = state.settings.lock().unwrap().exclusions.clone();
+    blocking(move || {
+        svc.dup_delete(&selections, recycle, &exclusions, &journal, &mut |p| {
+            let _ = app.emit("clean-progress", p);
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+async fn sys_list(state: State<'_, AppState>) -> Result<Vec<SysActionDto>, ApiError> {
+    let svc = state.svc.clone();
+    blocking(move || Ok(svc.sys_list())).await
+}
+
+#[tauri::command]
+async fn sys_run(state: State<'_, AppState>, id: String) -> Result<SysResultDto, ApiError> {
+    let svc = state.svc.clone();
+    let journal = state.journal_path.clone();
+    blocking(move || svc.sys_run(&id, &journal)).await
+}
+
+#[tauri::command]
 fn settings_get(state: State<'_, AppState>) -> Settings {
     state.settings.lock().unwrap().clone()
 }
@@ -208,6 +280,10 @@ pub fn run() {
                 Env::from_process(),
                 Box::new(windows_policy),
                 fast_scan(),
+            )
+            .with_system(
+                Arc::new(diskclean_core::sysaction::SystemRunner),
+                Box::new(windows_selected_policy),
             );
             app.manage(AppState {
                 svc: Arc::new(svc),
@@ -228,6 +304,12 @@ pub fn run() {
             plan_discard,
             plan_execute,
             clean_cancel,
+            dup_scan,
+            dup_cancel,
+            dup_current,
+            dup_delete,
+            sys_list,
+            sys_run,
             settings_get,
             settings_set_exclusions,
         ])

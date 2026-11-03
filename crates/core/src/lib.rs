@@ -2,11 +2,13 @@
 
 pub mod builtin;
 pub mod cleaner;
+pub mod duplicates;
 pub mod mft;
 pub mod plan;
 pub mod rules;
 pub mod safety;
 pub mod scanner;
+pub mod sysaction;
 
 /// 把字节数格式化为人类可读形式（1024 进制）。
 pub fn format_size(bytes: u64) -> String {

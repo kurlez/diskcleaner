@@ -3,6 +3,7 @@
   import { api } from '../lib/api';
   import { formatSize, percent } from '../lib/format';
   import { errorText, t } from '../lib/i18n.svelte';
+  import SystemTools from '../components/SystemTools.svelte';
   import type { CleanProgress, PlanSummary, Report, Rule } from '../lib/types';
 
   type Step = 'select' | 'preview' | 'running' | 'report';
@@ -118,6 +119,7 @@
       {analyzing ? t('clean.analyzing') : t('clean.analyze')}
     </button>
   </div>
+  <SystemTools />
 {:else if step === 'preview' && plan}
   <div class="card">
     <div class="row head">
@@ -200,6 +202,11 @@
       <p class="muted num">{t('report.counts', { deleted: report.deleted, recycled: report.recycled, failed: report.failed, refused: report.refused })}</p>
     {/if}
     {#if report.cancelled}<div class="note">{t('report.cancelled')}</div>{/if}
+    {#if report.service_errors.length}
+      <div class="note"><strong>{t('report.serviceErrors')}</strong>
+        {#each report.service_errors as e}<div class="mono small">{e}</div>{/each}
+      </div>
+    {/if}
 
     {#if report.problems.length}
       <h2 class="ph">{t('report.problems')}</h2>

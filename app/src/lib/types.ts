@@ -24,11 +24,23 @@ export interface Problem { rule_id: string; path: string; status: 'failed' | 're
 export interface Report {
   dry_run: boolean; freed_bytes: number; recycled_bytes: number; deleted: number;
   recycled: number; would_delete: number; failed: number; refused: number;
-  cancelled: boolean; problems: Problem[]; journal_path: string;
+  cancelled: boolean; problems: Problem[]; service_errors: string[]; journal_path: string;
 }
 export interface ScanProgress { files: number; dirs: number; bytes: number }
 export interface CleanProgress { done: number; total: number }
 export interface Settings { exclusions: string[] }
+
+export interface DupFile { path: string; modified: number }
+export interface DupGroup { id: number; size: number; wasted: number; keep: number; files: DupFile[] }
+export interface DupSummary {
+  groups: DupGroup[]; hidden_groups: number; total_wasted: number;
+  scanned_files: number; errors: number; cancelled: boolean;
+}
+export interface DupProgress { phase: 'walking' | 'partial' | 'full'; done: number; total: number }
+export interface DupSelection { group: number; file: number }
+
+export interface SysAction { id: string; risk: Risk; estimate: number | null }
+export interface SysResult { id: string; free_before: number | null; free_after: number | null; output: string }
 
 export interface ApiError { code: string; detail?: string | null }
 
@@ -45,6 +57,13 @@ export interface Api {
   cleanCancel(): Promise<void>;
   settingsGet(): Promise<Settings>;
   settingsSetExclusions(exclusions: string[]): Promise<Settings>;
+  dupScan(path: string, minSizeMb: number): Promise<DupSummary>;
+  dupCancel(): Promise<void>;
+  dupCurrent(): Promise<DupSummary>;
+  dupDelete(selections: DupSelection[], recycle: boolean): Promise<Report>;
+  sysList(): Promise<SysAction[]>;
+  sysRun(id: string): Promise<SysResult>;
+  onDupProgress(cb: (p: DupProgress) => void): Promise<() => void>;
   onScanProgress(cb: (p: ScanProgress) => void): Promise<() => void>;
   onCleanProgress(cb: (p: CleanProgress) => void): Promise<() => void>;
 }

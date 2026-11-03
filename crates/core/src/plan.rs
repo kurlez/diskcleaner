@@ -1,6 +1,6 @@
 //! 清理计划：把规则展开成"将要删除什么"的清单，只读，不修改任何文件。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,11 +53,26 @@ pub struct Plan {
     /// 为本计划扩展过允许根的策略；执行器用同一份策略做二次校验。
     pub policy: SafetyPolicy,
     pub cancelled: bool,
+    /// 规则 ID → 清理其文件前需要停止的服务。
+    pub rule_services: HashMap<String, Vec<String>>,
     /// 已纳入计划的路径，避免多条规则/目标重复处理同一路径。
     seen: HashSet<PathBuf>,
 }
 
 impl Plan {
+    /// 由调用方直接给出清单的计划（如用户亲自勾选的重复文件）。
+    /// 执行时仍会用 `policy` 逐项二次校验。
+    pub fn from_items(items: Vec<Candidate>, policy: SafetyPolicy) -> Plan {
+        Plan {
+            seen: items.iter().map(|c| c.path.clone()).collect(),
+            items,
+            skipped: Vec::new(),
+            policy,
+            cancelled: false,
+            rule_services: HashMap::new(),
+        }
+    }
+
     pub fn total_size(&self) -> u64 {
         self.items.iter().map(|c| c.size).sum()
     }
@@ -100,10 +115,15 @@ pub fn build_plan(
         skipped: Vec::new(),
         policy: base_policy.clone(),
         cancelled: false,
+        rule_services: HashMap::new(),
         seen: HashSet::new(),
     };
 
     for rule in rules.iter().filter(|r| selected.contains(&r.id.as_str())) {
+        if !rule.services.is_empty() {
+            plan.rule_services
+                .insert(rule.id.clone(), rule.services.clone());
+        }
         for target in &rule.targets {
             for root in target.resolve(env) {
                 if cancel.load(Ordering::Relaxed) {

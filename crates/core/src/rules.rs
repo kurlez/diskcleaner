@@ -61,6 +61,9 @@ pub struct Rule {
     pub default_selected: bool,
     pub disposal: Disposal,
     pub targets: Vec<Target>,
+    /// 清理该规则的文件前需要停止的 Windows 服务；清理结束后会恢复运行。
+    #[serde(default)]
+    pub services: Vec<String>,
 }
 
 /// 环境变量表（键大写，查询不区分大小写）。

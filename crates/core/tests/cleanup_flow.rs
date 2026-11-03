@@ -5,10 +5,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-use diskclean_core::cleaner::{execute, ExecOptions, Status};
+use std::cell::RefCell;
+
+use diskclean_core::cleaner::{execute, execute_with, ExecOptions, Status};
 use diskclean_core::plan::{build_plan, PlanSkipReason};
 use diskclean_core::rules::{Disposal, Env, Risk, Rule, Target, TargetKind};
 use diskclean_core::safety::{PathStyle, SafetyPolicy};
+use diskclean_core::sysaction::ServiceControl;
 
 static N: AtomicU64 = AtomicU64::new(0);
 
@@ -68,6 +71,7 @@ fn rule(id: &str, targets: Vec<Target>) -> Rule {
         default_selected: true,
         disposal: Disposal::Permanent,
         targets,
+        services: vec![],
     }
 }
 
@@ -396,4 +400,212 @@ fn cancel_stops_execution() {
     );
     assert!(report.cancelled);
     assert!(f.exists());
+}
+
+// ---------- 服务停启 ----------
+
+/// 记录调用顺序；`fail_stop` 中的服务停止时报错。
+struct FakeServices {
+    log: RefCell<Vec<String>>,
+    running: Vec<&'static str>,
+    fail_stop: Vec<&'static str>,
+}
+
+impl FakeServices {
+    fn new(running: &[&'static str], fail_stop: &[&'static str]) -> Self {
+        Self {
+            log: RefCell::new(vec![]),
+            running: running.to_vec(),
+            fail_stop: fail_stop.to_vec(),
+        }
+    }
+}
+
+impl ServiceControl for FakeServices {
+    fn stop(&self, name: &str) -> Result<bool, String> {
+        self.log.borrow_mut().push(format!("stop {name}"));
+        if self.fail_stop.contains(&name) {
+            return Err("access denied".into());
+        }
+        Ok(self.running.contains(&name))
+    }
+    fn start(&self, name: &str) -> Result<(), String> {
+        self.log.borrow_mut().push(format!("start {name}"));
+        Ok(())
+    }
+}
+
+fn rule_with_services(id: &str, target: &str, services: &[&str]) -> Rule {
+    let mut r = rule(id, vec![contents(target)]);
+    r.services = services.iter().map(|s| s.to_string()).collect();
+    r
+}
+
+#[test]
+fn services_are_stopped_before_and_restored_after_their_rule() {
+    let sb = Sandbox::new();
+    sb.write("upd/a.cab", 10);
+    sb.write("tmp/b.tmp", 10);
+    let rules = vec![
+        rule_with_services("upd", "%BASE%/upd", &["wuauserv", "bits"]),
+        rule("tmp", vec![contents("%BASE%/tmp")]),
+    ];
+    let plan = run_plan(&sb, &rules, &sb.policy());
+    let svc = FakeServices::new(&["wuauserv", "bits"], &[]);
+    let report = execute_with(
+        &plan,
+        ExecOptions::default(),
+        None,
+        Some(&svc),
+        &AtomicBool::new(false),
+        &mut |_, _| {},
+    );
+    assert_eq!(report.freed_bytes, 20);
+    assert!(report.service_errors.is_empty());
+    // 先停，处理完 upd 规则的文件后立即按相反顺序恢复，之后才轮到无服务的规则。
+    assert_eq!(
+        *svc.log.borrow(),
+        ["stop wuauserv", "stop bits", "start bits", "start wuauserv"]
+    );
+}
+
+#[test]
+fn only_services_we_stopped_are_restarted() {
+    let sb = Sandbox::new();
+    sb.write("upd/a.cab", 10);
+    let rules = vec![rule_with_services(
+        "upd",
+        "%BASE%/upd",
+        &["wuauserv", "bits"],
+    )];
+    let plan = run_plan(&sb, &rules, &sb.policy());
+    // bits 本来就没运行：不应被我们启动。
+    let svc = FakeServices::new(&["wuauserv"], &[]);
+    execute_with(
+        &plan,
+        ExecOptions::default(),
+        None,
+        Some(&svc),
+        &AtomicBool::new(false),
+        &mut |_, _| {},
+    );
+    assert_eq!(
+        *svc.log.borrow(),
+        ["stop wuauserv", "stop bits", "start wuauserv"]
+    );
+}
+
+#[test]
+fn services_are_restored_even_when_cancelled_midway() {
+    let sb = Sandbox::new();
+    sb.write("upd/a.cab", 10);
+    sb.write("upd/b.cab", 10);
+    let rules = vec![rule_with_services("upd", "%BASE%/upd", &["wuauserv"])];
+    let plan = run_plan(&sb, &rules, &sb.policy());
+    let svc = FakeServices::new(&["wuauserv"], &[]);
+    let cancel = AtomicBool::new(false);
+    // 处理完第一项后触发取消。
+    let report = execute_with(
+        &plan,
+        ExecOptions::default(),
+        None,
+        Some(&svc),
+        &cancel,
+        &mut |done, _| {
+            if done == 1 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        },
+    );
+    assert!(report.cancelled);
+    assert_eq!(*svc.log.borrow(), ["stop wuauserv", "start wuauserv"]);
+}
+
+#[test]
+fn service_failure_is_reported_but_files_are_still_processed() {
+    let sb = Sandbox::new();
+    sb.write("upd/a.cab", 10);
+    let rules = vec![rule_with_services("upd", "%BASE%/upd", &["wuauserv"])];
+    let plan = run_plan(&sb, &rules, &sb.policy());
+    let svc = FakeServices::new(&["wuauserv"], &["wuauserv"]);
+    let report = execute_with(
+        &plan,
+        ExecOptions::default(),
+        None,
+        Some(&svc),
+        &AtomicBool::new(false),
+        &mut |_, _| {},
+    );
+    assert_eq!(report.service_errors.len(), 1);
+    assert!(report.service_errors[0].contains("wuauserv"));
+    assert_eq!(report.freed_bytes, 10);
+    assert_eq!(
+        *svc.log.borrow(),
+        ["stop wuauserv"],
+        "没停成功就不应尝试恢复"
+    );
+}
+
+#[test]
+fn dry_run_never_touches_services() {
+    let sb = Sandbox::new();
+    sb.write("upd/a.cab", 10);
+    let rules = vec![rule_with_services("upd", "%BASE%/upd", &["wuauserv"])];
+    let plan = run_plan(&sb, &rules, &sb.policy());
+    let svc = FakeServices::new(&["wuauserv"], &[]);
+    let opts = ExecOptions {
+        dry_run: true,
+        ..Default::default()
+    };
+    execute_with(
+        &plan,
+        opts,
+        None,
+        Some(&svc),
+        &AtomicBool::new(false),
+        &mut |_, _| {},
+    );
+    assert!(svc.log.borrow().is_empty());
+}
+
+#[test]
+fn service_actions_are_journaled() {
+    let sb = Sandbox::new();
+    sb.write("upd/a.cab", 10);
+    let rules = vec![rule_with_services("upd", "%BASE%/upd", &["wuauserv"])];
+    let plan = run_plan(&sb, &rules, &sb.policy());
+    let svc = FakeServices::new(&["wuauserv"], &[]);
+    let mut buf: Vec<u8> = Vec::new();
+    execute_with(
+        &plan,
+        ExecOptions::default(),
+        Some(&mut buf),
+        Some(&svc),
+        &AtomicBool::new(false),
+        &mut |_, _| {},
+    );
+    let ops: Vec<String> = String::from_utf8(buf)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            match v["op"].as_str().unwrap() {
+                "service" => format!(
+                    "service:{}:{}",
+                    v["action"].as_str().unwrap(),
+                    v["name"].as_str().unwrap()
+                ),
+                other => other.to_string(),
+            }
+        })
+        .collect();
+    assert_eq!(
+        ops,
+        [
+            "service:stop:wuauserv",
+            "intent",
+            "result",
+            "service:start:wuauserv"
+        ]
+    );
 }

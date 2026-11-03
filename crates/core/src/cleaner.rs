@@ -11,6 +11,7 @@ use serde::Serialize;
 use crate::plan::{Candidate, Plan};
 use crate::rules::Disposal;
 use crate::scanner::special_reason;
+use crate::sysaction::ServiceControl;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExecOptions {
@@ -51,6 +52,8 @@ pub struct Report {
     /// 已移入回收站的字节数（尚未释放）。
     pub recycled_bytes: u64,
     pub cancelled: bool,
+    /// 停止/恢复服务时遇到的问题（不影响文件删除本身，但需要告知用户）。
+    pub service_errors: Vec<String>,
 }
 
 impl Report {
@@ -70,6 +73,13 @@ impl Report {
 #[derive(Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Record<'a> {
+    /// 停止或恢复 Windows 服务。
+    Service {
+        ts: u64,
+        action: &'a str,
+        name: &'a str,
+        ok: bool,
+    },
     /// 动手之前写入。崩溃后若只有 intent 没有 result，说明该项状态未知。
     Intent {
         ts: u64,
@@ -109,17 +119,91 @@ fn write_record(journal: &mut Option<&mut dyn Write>, rec: &Record) -> io::Resul
 pub fn execute(
     plan: &Plan,
     opts: ExecOptions,
+    journal: Option<&mut dyn Write>,
+    cancel: &AtomicBool,
+    on_progress: &mut dyn FnMut(usize, usize),
+) -> Report {
+    execute_with(plan, opts, journal, None, cancel, on_progress)
+}
+
+/// 记录并执行一次服务操作。
+fn service_op(
+    journal: &mut Option<&mut dyn Write>,
+    report: &mut Report,
+    action: &str,
+    name: &str,
+    result: Result<(), String>,
+) {
+    let ok = result.is_ok();
+    let _ = write_record(
+        journal,
+        &Record::Service {
+            ts: now_secs(),
+            action,
+            name,
+            ok,
+        },
+    );
+    if let Err(e) = result {
+        report.service_errors.push(format!("{action} {name}: {e}"));
+    }
+}
+
+/// 恢复我们停掉的服务。
+fn restore_services(
+    journal: &mut Option<&mut dyn Write>,
+    report: &mut Report,
+    ctl: Option<&dyn ServiceControl>,
+    stopped: &mut Vec<String>,
+) {
+    if let Some(ctl) = ctl {
+        // 与停止相反的顺序恢复。
+        for name in stopped.drain(..).rev() {
+            service_op(journal, report, "start", &name, ctl.start(&name));
+        }
+    }
+    stopped.clear();
+}
+
+/// 与 [`execute`] 相同，但会在每条规则的文件处理前后停止并恢复它声明的服务。
+///
+/// 服务只会恢复"我们自己停掉的"；无论取消、日志失败还是正常结束，都会恢复。
+/// dry-run 不碰任何服务。
+pub fn execute_with(
+    plan: &Plan,
+    opts: ExecOptions,
     mut journal: Option<&mut dyn Write>,
+    services: Option<&dyn ServiceControl>,
     cancel: &AtomicBool,
     on_progress: &mut dyn FnMut(usize, usize),
 ) -> Report {
     let mut report = Report::default();
     let total = plan.items.len();
+    let ctl = if opts.dry_run { None } else { services };
+    let mut stopped: Vec<String> = Vec::new();
+    let mut current_rule: Option<&str> = None;
 
     for (i, item) in plan.items.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             report.cancelled = true;
             break;
+        }
+        // 规则切换：恢复上一条规则停掉的服务，再停止新规则需要的服务。
+        if current_rule != Some(item.rule_id.as_str()) {
+            restore_services(&mut journal, &mut report, ctl, &mut stopped);
+            current_rule = Some(item.rule_id.as_str());
+            if let (Some(ctl), Some(names)) = (ctl, plan.rule_services.get(&item.rule_id)) {
+                for name in names {
+                    match ctl.stop(name) {
+                        Ok(true) => {
+                            stopped.push(name.clone());
+                            service_op(&mut journal, &mut report, "stop", name, Ok(()));
+                        }
+                        Ok(false) => {}
+                        Err(e) => service_op(&mut journal, &mut report, "stop", name, Err(e)),
+                    }
+                }
+            }
         }
         let disposal = opts.override_disposal.unwrap_or(item.disposal);
         let path_str = item.path.to_string_lossy().into_owned();
@@ -170,6 +254,7 @@ pub fn execute(
         });
         on_progress(i + 1, total);
     }
+    restore_services(&mut journal, &mut report, ctl, &mut stopped);
     report
 }
 

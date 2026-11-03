@@ -12,9 +12,12 @@ const SKIP_REASONS = [
 ];
 // 扫描回退原因代码（后端 FastScanFn 返回）。
 const FALLBACK_CODES = ['access_denied', 'not_ntfs', 'path_not_found', 'other'];
+const SYS_ACTIONS = ['recycle_bin', 'hibernation', 'component_store', 'windows_old', 'shadow_copy'];
 const ERROR_CODES = [
   'unsupported_platform', 'invalid_path', 'scan_failed', 'unknown_rule', 'no_plan', 'no_scan',
   'journal_failed', 'invalid_exclusion', 'settings_failed', 'policy', 'internal', 'unknown',
+  'must_keep_one', 'keeper_changed', 'changed_since_scan', 'invalid_selection', 'nothing_selected',
+  'unknown_action', 'sys_failed',
 ];
 
 describe('locales', () => {
@@ -38,6 +41,7 @@ describe('locales', () => {
         expect(d[`rule.${id}.desc`], id).toBeTruthy();
       }
       for (const r of SKIP_REASONS) expect(d[`skip.${r}`], r).toBeTruthy();
+      for (const a of SYS_ACTIONS) for (const k of ['name', 'desc', 'warn']) expect(d[`sys.${a}.${k}`], a).toBeTruthy();
       for (const c of FALLBACK_CODES) expect(d[`scan.fallback.${c}`], c).toBeTruthy();
       for (const c of ERROR_CODES) expect(d[`err.${c}`], c).toBeTruthy();
     }

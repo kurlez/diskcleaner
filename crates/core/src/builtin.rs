@@ -45,7 +45,13 @@ fn rule(id: &str, risk: Risk, default_selected: bool, targets: Vec<Target>) -> R
         // 内置规则清理的都是可再生数据，直接删除才能真正释放空间。
         disposal: Disposal::Permanent,
         targets,
+        services: Vec::new(),
     }
+}
+
+fn with_services(mut r: Rule, services: &[&str]) -> Rule {
+    r.services = services.iter().map(|s| s.to_string()).collect();
+    r
 }
 
 pub fn windows_rules() -> Vec<Rule> {
@@ -110,13 +116,15 @@ pub fn windows_rules() -> Vec<Rule> {
                 contents("%LOCALAPPDATA%/Mozilla/Firefox/Profiles/*/cache2"),
             ],
         ),
-        // 更新下载缓存：正在使用时部分文件会删除失败（会被如实记录）。
-        // 理想做法是先停止 wuauserv，留待 M5 的"系统动作"实现。
-        rule(
-            "windows_update_cache",
-            Medium,
-            false,
-            vec![contents("%SystemRoot%/SoftwareDistribution/Download")],
+        // 更新下载缓存：清理前先停止 Windows Update 与后台传输服务，结束后恢复。
+        with_services(
+            rule(
+                "windows_update_cache",
+                Medium,
+                false,
+                vec![contents("%SystemRoot%/SoftwareDistribution/Download")],
+            ),
+            &["wuauserv", "bits"],
         ),
         // 开发者缓存：可再生，但会增加下次构建/安装时间，默认不勾选。
         rule(
@@ -157,6 +165,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn update_cache_rule_stops_update_services() {
+        let rules = windows_rules();
+        let r = rules
+            .iter()
+            .find(|r| r.id == "windows_update_cache")
+            .unwrap();
+        assert_eq!(r.services, ["wuauserv", "bits"]);
+        assert!(rules
+            .iter()
+            .filter(|r| r.id != "windows_update_cache")
+            .all(|r| r.services.is_empty()));
     }
 
     #[test]

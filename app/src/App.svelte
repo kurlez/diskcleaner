@@ -3,6 +3,7 @@
   import { nav, type View } from './lib/nav.svelte';
   import Dashboard from './views/Dashboard.svelte';
   import Scan from './views/Scan.svelte';
+  import Duplicates from './views/Duplicates.svelte';
   import Clean from './views/Clean.svelte';
   import SettingsView from './views/Settings.svelte';
 
@@ -11,6 +12,7 @@
   const items: { view: View; key: string; icon: string }[] = [
     { view: 'dashboard', key: 'nav.dashboard', icon: 'M3 12l9-8 9 8M5 10v10h5v-6h4v6h5V10' },
     { view: 'scan', key: 'nav.scan', icon: 'M11 4a7 7 0 100 14 7 7 0 000-14zM21 21l-5-5' },
+    { view: 'duplicates', key: 'nav.duplicates', icon: 'M8 7h10v12H8zM6 17V5h10' },
     { view: 'clean', key: 'nav.clean', icon: 'M4 20l6-6M14 4l6 6-8 8-6-6 8-8z' },
     { view: 'settings', key: 'nav.settings', icon: 'M12 15a3 3 0 100-6 3 3 0 000 6zM19 12a7 7 0 00-.1-1.2l2-1.5-2-3.4-2.3.9a7 7 0 00-2-1.2L14 3h-4l-.6 2.6a7 7 0 00-2 1.2l-2.3-.9-2 3.4 2 1.5A7 7 0 005 12c0 .4 0 .8.1 1.2l-2 1.5 2 3.4 2.3-.9a7 7 0 002 1.2L10 21h4l.6-2.6a7 7 0 002-1.2l2.3.9 2-3.4-2-1.5c.1-.4.1-.8.1-1.2z' },
   ];
@@ -44,6 +46,7 @@
   <main>
     <section hidden={nav.view !== 'dashboard'}><Dashboard /></section>
     <section hidden={nav.view !== 'scan'}><Scan /></section>
+    <section hidden={nav.view !== 'duplicates'}><Duplicates /></section>
     <section hidden={nav.view !== 'clean'}><Clean /></section>
     <section hidden={nav.view !== 'settings'}><SettingsView /></section>
   </main>
