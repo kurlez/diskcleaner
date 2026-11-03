@@ -46,7 +46,7 @@
 |---|---|---|
 | M1 | workspace、路径安全模块、遍历扫描器、CLI | 完成 |
 | M2 | 规则引擎 + Windows 规则集；预览/执行/回收站/日志/dry-run | 完成（待 Windows 真机验证） |
-| M3 | Tauri GUI（概览、扫描、目录树、清理向导、报告，中英双语） | 待做 |
+| M3 | Tauri GUI（概览、扫描、目录树、清理向导、报告，中英双语） | 完成（待 Windows 真机验证） |
 | M4 | MFT 快速扫描；treemap；设置页 | 待做 |
 | M5 | 重复文件、USN 增量、系统工具封装；打包签名 | 待做 |
 
@@ -60,3 +60,16 @@
 - 回收站不释放空间：报告分开统计 `freed_bytes` 与 `recycled_bytes`；
   内置规则清理的都是可再生数据，默认 `Permanent`，可用 `--recycle` 覆盖。
 - 未纳入 M2：清空回收站、`Windows.old`、`DISM`、休眠文件、卷影副本、停止 `wuauserv`（M5 的"系统动作"）。
+
+## M3 设计要点
+- 结构：`app/src-tauri`（Tauri 2 后端）+ `app/`（Svelte 5 + TS + Vite 前端）。
+  后端逻辑集中在 `service.rs`（与 Tauri 无关，可单测），`lib.rs` 只做命令封装。
+- **前端只能提交规则 ID**；真正要删除的路径始终来自后端保存的计划，且计划一次性有效。
+- 长任务（扫描、分析、执行）在阻塞线程池运行，通过 `scan-progress` / `clean-progress` 事件推送进度，可取消。
+- 扫描结果保留在后端，目录树按需懒加载（每层最多 1000 项）。
+- 错误以 `{code, detail}` 返回，由前端按 `err.<code>` 翻译。
+- i18n：`zh` / `en` 两套词典，单测校验键集合、占位符一致，且覆盖所有规则、跳过原因与错误码。
+- 管理员权限：发布版（release）嵌入 `requireAdministrator` manifest；开发版不加，否则 `tauri dev` 无法启动。
+- 安全：严格 CSP；capabilities 只开放事件监听；前端不加载任何外部资源。
+- 浏览器里 `npm run dev` 会使用 `lib/mock.ts` 的模拟数据预览界面；发布版不含 mock。
+- 暂未做：treemap 可视化与 MFT 快速扫描（M4）、"清空回收站"等系统动作（M5）。

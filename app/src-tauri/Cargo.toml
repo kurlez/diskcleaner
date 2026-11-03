@@ -1,0 +1,19 @@
+[package]
+name = "diskclean-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "diskclean_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = "2"
+
+[dependencies]
+tauri = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = { version = "0.37", default-features = false, features = ["disk"] }
+diskclean-core = { path = "../../crates/core" }
