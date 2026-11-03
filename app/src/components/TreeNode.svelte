@@ -2,6 +2,9 @@
   import { api } from '../lib/api';
   import { formatSize, percent } from '../lib/format';
   import { errorText, t } from '../lib/i18n.svelte';
+  import { iconKind } from '../lib/fileicon';
+  import { hasCand, toggleCand } from '../lib/candidates.svelte';
+  import Icon from './Icon.svelte';
   import type { Child } from '../lib/types';
   import TreeNode from './TreeNode.svelte';
 
@@ -15,6 +18,8 @@
   let kids = $state<{ items: Child[]; hidden: number } | null>(null);
 
   const parts = $derived([...parentParts, item.name]);
+  const picked = $derived(hasCand(parts));
+  const kind = $derived(iconKind(item.name, item.is_dir));
 
   async function toggle() {
     if (!item.is_dir) return;
@@ -43,10 +48,22 @@
     {:else}
       <span class="caret"></span>
     {/if}
-    <span class="name ellipsis" title={item.name}>{item.name}</span>
+    <span class="name"><Icon {kind} {open} /><span class="ellipsis" title={item.name}>{item.name}</span></span>
     <span class="bar" aria-hidden="true"><i style="width:{percent(item.size, parentSize)}%"></i></span>
     <span class="size num">{formatSize(item.size)}</span>
     <span class="count muted num">{t('scan.files', { n: item.file_count.toLocaleString() })}</span>
+    <button
+      class="link add"
+      class:on={picked}
+      title={picked ? t('cand.added') : t('cand.add')}
+      aria-label={picked ? t('cand.added') : t('cand.add')}
+      aria-pressed={picked}
+      onclick={() => toggleCand({ parts, name: item.name, size: item.size, is_dir: item.is_dir, file_count: item.file_count })}
+    >
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        {#if picked}<path d="M5 12.5l4.5 4.5L19 7.5" />{:else}<path d="M12 5v14M5 12h14" />{/if}
+      </svg>
+    </button>
     <button class="link rev" title={t('scan.reveal')} aria-label={t('scan.reveal')} onclick={() => api.reveal(parts).catch(() => {})}>
       <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M3 7h6l2 2h10v10H3z" /></svg>
     </button>
@@ -73,7 +90,7 @@
 <style>
   ul { list-style: none; margin: 0; padding: 0; }
   li { list-style: none; min-width: 0; }
-  .line { display: grid; grid-template-columns: 22px minmax(60px, 1fr) 72px 76px 92px 24px; align-items: center; gap: 8px; padding-top: 4px; padding-bottom: 4px; border-radius: 6px; }
+  .line { display: grid; grid-template-columns: 22px minmax(60px, 1fr) 72px 76px 92px 24px 24px; align-items: center; gap: 8px; padding-top: 4px; padding-bottom: 4px; border-radius: 6px; }
   .line:hover { background: var(--surface-2); }
   .caret { width: 22px; height: 22px; padding: 0; min-height: 0; border: none; background: none; display: inline-flex; align-items: center; justify-content: center; color: var(--muted); }
   svg.rot { transform: rotate(90deg); }
@@ -81,4 +98,8 @@
   .size { text-align: right; }
   .count { font-size: 12px; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .rev { padding: 2px; }
+  .add { padding: 2px; color: var(--muted); border-radius: 6px; }
+  .add:hover { color: var(--accent); }
+  .add.on { color: var(--accent-text); background: var(--accent); }
+  .name { display: flex; align-items: center; gap: 6px; min-width: 0; }
 </style>

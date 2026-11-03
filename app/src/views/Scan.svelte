@@ -5,6 +5,10 @@
   import { nav } from '../lib/nav.svelte';
   import TreeNode from '../components/TreeNode.svelte';
   import Treemap from '../components/Treemap.svelte';
+  import CandidatePanel from '../components/CandidatePanel.svelte';
+  import Icon from '../components/Icon.svelte';
+  import { iconKind } from '../lib/fileicon';
+  import { clearCands } from '../lib/candidates.svelte';
   import type { Child, ScanProgress, ScanSummary } from '../lib/types';
 
   let path = $state(nav.scanPath);
@@ -24,6 +28,7 @@
     summary = null;
     progress = null;
     mapParts = [];
+    clearCands(); // 新扫描会使旧的路径分量失效
     const unlisten = await api.onScanProgress((p) => (progress = p));
     try {
       summary = await api.scanStart(path.trim());
@@ -111,7 +116,7 @@
         {#each summary.top_files as f}
           <li>
             <span class="size num">{formatSize(f.size)}</span>
-            <span class="path mono ellipsis" title={f.path}>{f.path}</span>
+            <span class="fl"><Icon kind={iconKind(f.path.split(/[\\/]/).pop() ?? '', false)} size={16} /><span class="path mono ellipsis" title={f.path}>{f.path}</span></span>
           </li>
         {/each}
       </ol>
@@ -120,6 +125,8 @@
 {:else if !error}
   <p class="muted">{t('scan.hint')}</p>
 {/if}
+
+<CandidatePanel />
 
 <style>
   .lead { margin-bottom: 16px; }
@@ -142,4 +149,5 @@
   .top { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
   .top li { display: grid; grid-template-columns: 78px 1fr; gap: 8px; align-items: baseline; }
   .size { text-align: right; font-weight: 600; }
+  .fl { display: flex; align-items: center; gap: 6px; min-width: 0; }
 </style>

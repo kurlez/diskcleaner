@@ -3,6 +3,8 @@
   import { api } from '../lib/api';
   import { formatSize } from '../lib/format';
   import { errorText, t } from '../lib/i18n.svelte';
+  import Icon from '../components/Icon.svelte';
+  import { iconKind, type IconKind } from '../lib/fileicon';
   import type { AppInfo, Leftover, LeftoverReport, Leftovers } from '../lib/types';
 
   type Step = 'list' | 'confirm' | 'force' | 'running' | 'scanning' | 'still' | 'leftovers' | 'deleting' | 'done';
@@ -139,6 +141,12 @@
       .join(' · ');
   }
 
+  function leftIcon(it: Leftover): IconKind {
+    if (it.kind === 'reg_key') return 'regkey';
+    if (it.kind === 'reg_value') return 'regvalue';
+    return iconKind(it.path.split(/[\\/]/).pop() ?? '', it.kind === 'folder');
+  }
+
   const isFile = (k: string) => k === 'folder' || k === 'file';
   const fileItems = $derived(left?.items.filter((i) => isFile(i.kind)) ?? []);
   const regItems = $derived(left?.items.filter((i) => !isFile(i.kind)) ?? []);
@@ -268,6 +276,7 @@
               <li>
                 <label class="row">
                   <input type="checkbox" checked={selected.has(it.id)} disabled={step === 'deleting'} onchange={() => toggle(it.id)} aria-label={it.path} />
+                  <Icon kind={leftIcon(it)} />
                   <span class="grow">
                     <span class="mono path" title={it.path}>{it.path}</span>
                     <span class="muted small">{detail(it)}</span>
@@ -342,7 +351,7 @@
   .left { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
   .left li { padding: 6px 8px; border-radius: 6px; }
   .left li:hover { background: var(--surface-2); }
-  .left label { cursor: pointer; align-items: flex-start; }
+  .left label { cursor: pointer; align-items: flex-start; gap: 8px; }
   .path { display: block; word-break: break-all; }
   .opts { display: flex; flex-direction: column; gap: 8px; padding-top: 10px; border-top: 1px solid var(--border); }
   .opt { display: flex; gap: 10px; align-items: center; }

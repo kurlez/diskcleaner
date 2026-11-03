@@ -680,7 +680,7 @@ dependencies = [
  "diskclean-core",
  "serde",
  "serde_json",
- "sysinfo",
+ "sysinfo 0.37.2",
  "tauri",
  "tauri-build",
 ]
@@ -702,7 +702,9 @@ dependencies = [
  "same-file",
  "serde",
  "serde_json",
+ "sysinfo 0.40.1",
  "trash",
+ "windows-sys 0.61.2",
  "winreg",
 ]
 
@@ -1982,6 +1984,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ntapi"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3b335231dfd352ffb0f8017f3b6027a4917f7df785ea2143d8af2adc66980ae"
+dependencies = [
+ "winapi",
+]
+
+[[package]]
 name = "ntfs"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3139,6 +3150,20 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-io-kit",
  "windows 0.61.3",
+]
+
+[[package]]
+name = "sysinfo"
+version = "0.40.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e8a3edbe0394ce115f3917a00349dd242be09eb5a091ed509eaf67b55cfb8a8"
+dependencies = [
+ "libc",
+ "memchr",
+ "ntapi",
+ "objc2-core-foundation",
+ "objc2-io-kit",
+ "windows 0.62.2",
 ]
 
 [[package]]

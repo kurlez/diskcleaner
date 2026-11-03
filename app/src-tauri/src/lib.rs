@@ -12,7 +12,7 @@ use diskclean_core::uninstall::{self, FsRoots};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use service::{
-    ApiError, AppDto, ChildrenDto, DriveDto, DupSelection, DupSummary, ExecRequest,
+    ApiError, AppDto, CandResolved, ChildrenDto, DriveDto, DupSelection, DupSummary, ExecRequest,
     LeftoverReportDto, LeftoversDto, PlanSummary, ReportDto, RuleDto, ScanSummary, Service,
     SysActionDto, SysResultDto, UninstallRunDto,
 };
@@ -312,6 +312,32 @@ async fn app_delete_leftovers(
 }
 
 #[tauri::command]
+fn cand_resolve(
+    state: State<'_, AppState>,
+    items: Vec<Vec<String>>,
+) -> Result<Vec<CandResolved>, ApiError> {
+    state.svc.cand_resolve(&items)
+}
+
+#[tauri::command]
+async fn cand_delete(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    items: Vec<Vec<String>>,
+    recycle: bool,
+) -> Result<ReportDto, ApiError> {
+    let svc = state.svc.clone();
+    let journal = state.journal_path.clone();
+    let exclusions = state.settings.lock().unwrap().exclusions.clone();
+    blocking(move || {
+        svc.cand_delete(&items, recycle, &exclusions, &journal, &mut |p| {
+            let _ = app.emit("clean-progress", p);
+        })
+    })
+    .await
+}
+
+#[tauri::command]
 fn settings_get(state: State<'_, AppState>) -> Settings {
     state.settings.lock().unwrap().clone()
 }
@@ -385,6 +411,8 @@ pub fn run() {
             app_uninstall,
             app_leftovers,
             app_delete_leftovers,
+            cand_resolve,
+            cand_delete,
             settings_get,
             settings_set_exclusions,
         ])

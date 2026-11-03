@@ -5,6 +5,7 @@ pub mod cleaner;
 pub mod duplicates;
 pub mod mft;
 pub mod plan;
+pub mod procs;
 pub mod registry;
 pub mod rules;
 pub mod safety;

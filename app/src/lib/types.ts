@@ -57,6 +57,10 @@ export interface Leftovers { items: Leftover[]; still_registered: boolean; insta
 export interface RegResult { path: string; value_name: string | null; status: 'deleted' | 'missing' | 'refused' | 'failed'; detail: string | null }
 export interface LeftoverReport { registry: RegResult[]; files: Report; backup_file: string | null }
 
+export interface CandResolved {
+  path: string; is_dir: boolean; size: number; files: number; exists: boolean; is_link: boolean;
+}
+
 export interface ApiError { code: string; detail?: string | null }
 
 export interface Api {
@@ -78,6 +82,8 @@ export interface Api {
   dupDelete(selections: DupSelection[], recycle: boolean): Promise<Report>;
   sysList(): Promise<SysAction[]>;
   sysRun(id: string): Promise<SysResult>;
+  candResolve(items: string[][]): Promise<CandResolved[]>;
+  candDelete(items: string[][], recycle: boolean): Promise<Report>;
   appsList(includeStore: boolean): Promise<AppInfo[]>;
   appUninstall(id: number, silent: boolean): Promise<UninstallRun>;
   appLeftovers(id: number, forced: boolean): Promise<Leftovers>;

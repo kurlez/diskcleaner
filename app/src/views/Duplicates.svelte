@@ -2,6 +2,8 @@
   import { api } from '../lib/api';
   import { formatSize, percent } from '../lib/format';
   import { errorText, i18n, t } from '../lib/i18n.svelte';
+  import Icon from '../components/Icon.svelte';
+  import { iconKind } from '../lib/fileicon';
   import type { DupGroup, DupProgress, DupSummary, Report } from '../lib/types';
 
   let path = $state('');
@@ -154,6 +156,7 @@
               <li class:marked={selected.has(key(g.id, i))}>
                 <label class="row">
                   <input type="checkbox" checked={selected.has(key(g.id, i))} disabled={lockedLast(g, i) || deleting} onchange={() => toggle(g, i)} aria-label={f.path} />
+                  <Icon kind={iconKind(f.path.split(/[\\/]/).pop() ?? '', false)} size={16} />
                   <span class="mono grow ellipsis" title={f.path}>{f.path}</span>
                   {#if i === g.keep && !selected.has(key(g.id, i))}<span class="badge low">{t('dup.keepBadge')}</span>{/if}
                   <span class="muted small nowrap">{t('dup.modified', { date: date(f.modified) })}</span>

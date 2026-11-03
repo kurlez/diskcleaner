@@ -194,6 +194,23 @@ export const mockApi: Api = {
     if (id === 'shadow_copy') throw { code: 'sys_failed', detail: 'command_failed: vssadmin.exe exited with 1: No items found that satisfy the query.' };
     return { id, free_before: 38 * GB, free_after: 44 * GB, output: '' };
   },
+  async candResolve(items) {
+    await sleep(120);
+    return items.map((parts) => ({
+      path: ['C:', ...parts].join('\\'),
+      is_dir: !/\.[a-z0-9]+$/i.test(parts[parts.length - 1] ?? ''),
+      size: 150 * MB, files: 12, exists: true, is_link: false,
+    }));
+  },
+  async candDelete(items, recycle) {
+    await sleep(600);
+    return {
+      dry_run: false, freed_bytes: recycle ? 0 : items.length * 150 * MB, recycled_bytes: recycle ? items.length * 150 * MB : 0,
+      deleted: recycle ? 0 : items.length, recycled: recycle ? items.length : 0, would_delete: 0,
+      failed: 0, refused: 0, cancelled: false, problems: [], service_errors: [],
+      journal_path: 'C:\\Users\\alice\\AppData\\Roaming\\com.kurlez.diskcleaner\\journal.jsonl',
+    };
+  },
   async appsList(includeStore) {
     await sleep(300);
     return apps.filter((a) => includeStore || a.kind === 'desktop');

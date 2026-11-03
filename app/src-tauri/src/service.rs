@@ -315,6 +315,20 @@ pub struct LeftoverReportDto {
     pub backup_file: Option<String>,
 }
 
+// ---------- 候选清单 DTO ----------
+
+#[derive(Debug, Serialize)]
+pub struct CandResolved {
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub files: u64,
+    /// 磁盘上是否还存在（扫描之后可能已被删除）。
+    pub exists: bool,
+    /// 是链接/junction/云占位文件：这类项不会被处理。
+    pub is_link: bool,
+}
+
 // ---------- Service ----------
 
 pub type PolicyFactory = dyn Fn(&[String]) -> Result<SafetyPolicy> + Send + Sync;
@@ -903,6 +917,136 @@ impl Service {
             files: report_dto(&out.files, false, journal_path),
             backup_file: out.backup_file.as_deref().map(display_path),
         })
+    }
+
+    // ----- 候选清单 -----
+
+    /// 由扫描结果里的目录名序列得到：真实路径、是否目录、扫描时的大小和文件数。
+    fn scan_entry(&self, parts: &[String]) -> Result<(PathBuf, bool, u64, u64)> {
+        let guard = self.scan.lock().unwrap();
+        let state = guard.as_ref().ok_or(ApiError::new("no_scan"))?;
+        let mut node = &state.root;
+        let mut path = state.root_path.clone();
+        for part in parts {
+            node = node
+                .children
+                .iter()
+                .find(|c| &c.name == part)
+                .ok_or_else(|| ApiError::with("invalid_path", part))?;
+            path.push(part);
+        }
+        Ok((path, node.is_dir, node.size, node.file_count))
+    }
+
+    /// 把候选项（扫描树里的路径分量）解析成真实路径与当前状态，供"整体检查"展示。
+    pub fn cand_resolve(&self, items: &[Vec<String>]) -> Result<Vec<CandResolved>> {
+        items
+            .iter()
+            .map(|parts| {
+                let (path, is_dir, size, files) = self.scan_entry(parts)?;
+                let meta = fs::symlink_metadata(&path);
+                Ok(CandResolved {
+                    path: display_path(&path),
+                    is_dir,
+                    size,
+                    files,
+                    exists: meta.is_ok(),
+                    is_link: meta
+                        .as_ref()
+                        .is_ok_and(|m| scanner::special_reason(m).is_some()),
+                })
+            })
+            .collect()
+    }
+
+    /// 删除候选清单里的项目。前端只传扫描树里的路径分量；真实路径由后端取得。
+    ///
+    /// * 一项包含另一项时（目录与其子项）只处理外层，避免重复；
+    /// * 链接、云占位文件、含受保护内容（如 `.git`）的目录会被拒绝并列入报告，不会删除；
+    /// * 其余走统一的执行器（二次校验、先写日志）。
+    pub fn cand_delete(
+        &self,
+        items: &[Vec<String>],
+        recycle: bool,
+        exclusions: &[String],
+        journal_path: &Path,
+        on_progress: &mut dyn FnMut(CleanProgressDto),
+    ) -> Result<ReportDto> {
+        if items.is_empty() {
+            return Err(ApiError::new("nothing_selected"));
+        }
+        let mut entries: Vec<(PathBuf, bool, u64, u64)> = Vec::new();
+        for parts in items {
+            let e = self.scan_entry(parts)?;
+            if parts.is_empty() {
+                return Err(ApiError::with("invalid_path", "scan root"));
+            }
+            entries.push(e);
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.dedup_by(|a, b| a.0 == b.0);
+        // 外层已包含的子项不再单独处理。
+        let paths: Vec<PathBuf> = entries.iter().map(|e| e.0.clone()).collect();
+        entries.retain(|e| !paths.iter().any(|p| *p != e.0 && e.0.starts_with(p)));
+
+        let disposal = if recycle {
+            Disposal::Recycle
+        } else {
+            Disposal::Permanent
+        };
+        let mut candidates = Vec::new();
+        let mut problems: Vec<Problem> = Vec::new();
+        for (path, is_dir, size, files) in entries {
+            let refuse = |detail: &str| Problem {
+                rule_id: "candidates".into(),
+                path: display_path(&path),
+                status: "refused",
+                detail: detail.into(),
+            };
+            match fs::symlink_metadata(&path) {
+                Err(_) => problems.push(refuse("no longer exists")),
+                Ok(m) if scanner::special_reason(&m).is_some() => {
+                    problems.push(refuse("link or cloud placeholder"))
+                }
+                Ok(_) => {
+                    if is_dir {
+                        if let Ok(stats) = diskclean_core::plan::measure_path(&path) {
+                            if let Some(b) = stats.blocker {
+                                problems.push(refuse(&format!("{b:?}")));
+                                continue;
+                            }
+                        }
+                    }
+                    candidates.push(Candidate {
+                        rule_id: "candidates".into(),
+                        path,
+                        is_dir,
+                        size,
+                        file_count: files,
+                        disposal,
+                    });
+                }
+            }
+        }
+
+        let policy = (self.selected_policy_factory)(exclusions)?;
+        let plan = Plan::from_items(candidates, policy);
+        self.clean_cancel.store(false, Ordering::Relaxed);
+        let mut journal = open_journal(journal_path)?;
+        let report = execute_with(
+            &plan,
+            ExecOptions::default(),
+            Some(&mut journal as &mut dyn Write),
+            None,
+            &self.clean_cancel,
+            &mut |done, total| on_progress(CleanProgressDto { done, total }),
+        );
+        let mut dto = report_dto(&report, false, journal_path);
+        dto.refused += problems.len();
+        problems.append(&mut dto.problems);
+        problems.truncate(MAX_PROBLEMS);
+        dto.problems = problems;
+        Ok(dto)
     }
 
     // ----- 系统动作 -----
@@ -2277,6 +2421,175 @@ mod tests {
         assert!(d.join("Roaming/Foo/settings.json").exists(), "排除项优先");
         assert_eq!(rep.files.refused, 1);
         assert!(!d.join("PF/Foo").exists());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    // ---------- 候选清单 ----------
+
+    fn scanned(d: &Path) -> Service {
+        write(&d.join("keep/a.bin"), 10);
+        write(&d.join("junk/big.bin"), 500);
+        write(&d.join("junk/sub/x.bin"), 50);
+        write(&d.join("repo/.git/HEAD"), 5);
+        write(&d.join("repo/code.rs"), 5);
+        let svc = dup_service(d, FakeRunner::scripted(vec![]));
+        svc.scan(d.to_str().unwrap(), &mut |_| {}).unwrap();
+        svc
+    }
+
+    fn parts(p: &[&str]) -> Vec<String> {
+        p.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn candidates_resolve_to_real_paths_with_current_state() {
+        let d = sandbox();
+        let svc = scanned(&d);
+        let r = svc
+            .cand_resolve(&[parts(&["junk"]), parts(&["junk", "big.bin"])])
+            .unwrap();
+        assert_eq!(r[0].path, d.join("junk").to_string_lossy());
+        assert!(r[0].is_dir && r[0].exists && !r[0].is_link);
+        assert_eq!((r[0].size, r[0].files), (550, 2));
+        assert_eq!(r[1].size, 500);
+        // 扫描之后被删除的项如实报告为不存在。
+        fs::remove_file(d.join("junk/big.bin")).unwrap();
+        let r = svc.cand_resolve(&[parts(&["junk", "big.bin"])]).unwrap();
+        assert!(!r[0].exists);
+        assert_eq!(
+            svc.cand_resolve(&[parts(&["nope"])]).unwrap_err().code,
+            "invalid_path"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn candidate_resolution_needs_a_scan() {
+        let d = sandbox();
+        assert_eq!(
+            dup_service(&d, FakeRunner::scripted(vec![]))
+                .cand_resolve(&[parts(&["x"])])
+                .unwrap_err()
+                .code,
+            "no_scan"
+        );
+    }
+
+    #[test]
+    fn deleting_candidates_removes_files_and_directories() {
+        let d = sandbox();
+        let svc = scanned(&d);
+        let rep = svc
+            .cand_delete(
+                &[parts(&["junk"]), parts(&["keep", "a.bin"])],
+                false,
+                &[],
+                &d.join("j"),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!((rep.deleted, rep.refused, rep.failed), (2, 0, 0));
+        assert_eq!(rep.freed_bytes, 560);
+        assert!(!d.join("junk").exists() && !d.join("keep/a.bin").exists());
+        assert!(d.join("keep").exists(), "只删选中的文件，不动它的父目录");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn nested_candidates_are_only_processed_once_through_the_outer_item() {
+        let d = sandbox();
+        let svc = scanned(&d);
+        let rep = svc
+            .cand_delete(
+                &[
+                    parts(&["junk", "sub", "x.bin"]),
+                    parts(&["junk"]),
+                    parts(&["junk", "big.bin"]),
+                ],
+                false,
+                &[],
+                &d.join("j"),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(rep.deleted, 1, "目录与其中的文件同时被选时只处理目录");
+        assert_eq!(rep.failed, 0);
+        assert_eq!(rep.freed_bytes, 550, "大小不能重复计算");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn directories_with_protected_content_or_gone_items_are_refused_not_deleted() {
+        let d = sandbox();
+        let svc = scanned(&d);
+        fs::remove_file(d.join("keep/a.bin")).unwrap();
+        let rep = svc
+            .cand_delete(
+                &[
+                    parts(&["repo"]),
+                    parts(&["keep", "a.bin"]),
+                    parts(&["junk", "big.bin"]),
+                ],
+                false,
+                &[],
+                &d.join("j"),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(rep.deleted, 1);
+        assert_eq!(rep.refused, 2);
+        assert!(
+            d.join("repo/.git/HEAD").exists(),
+            "含 .git 的目录不能被整体删除"
+        );
+        assert!(rep.problems.iter().any(|p| p.path.ends_with("repo")));
+        assert!(!d.join("junk/big.bin").exists());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn candidate_deletion_respects_the_policy_and_exclusions_and_validates_input() {
+        let d = sandbox();
+        let svc = scanned(&d);
+        // 受保护目录（测试策略里的 locked）与用户排除项都不能被删。
+        write(&d.join("locked/secret.bin"), 3);
+        svc.scan(d.to_str().unwrap(), &mut |_| {}).unwrap();
+        let rep = svc
+            .cand_delete(
+                &[parts(&["locked", "secret.bin"])],
+                false,
+                &[],
+                &d.join("j"),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!((rep.deleted, rep.refused), (0, 1));
+        let excl = [d.join("junk").to_string_lossy().into_owned()];
+        let rep = svc
+            .cand_delete(&[parts(&["junk"])], false, &excl, &d.join("j"), &mut |_| {})
+            .unwrap();
+        assert_eq!((rep.deleted, rep.refused), (0, 1));
+        assert!(d.join("junk/big.bin").exists());
+
+        assert_eq!(
+            svc.cand_delete(&[], false, &[], &d.join("j"), &mut |_| {})
+                .unwrap_err()
+                .code,
+            "nothing_selected"
+        );
+        assert_eq!(
+            svc.cand_delete(&[parts(&[])], false, &[], &d.join("j"), &mut |_| {})
+                .unwrap_err()
+                .code,
+            "invalid_path",
+            "扫描根本身不能当作候选"
+        );
+        assert_eq!(
+            svc.cand_delete(&[parts(&["ghost"])], false, &[], &d.join("j"), &mut |_| {})
+                .unwrap_err()
+                .code,
+            "invalid_path"
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 }
