@@ -329,3 +329,25 @@ fn measure(path: &Path, meta: &Metadata, depth: usize) -> Measure {
     }
     m
 }
+
+/// 目录（或文件）的统计结果。
+#[derive(Debug, Clone)]
+pub struct TreeStats {
+    pub size: u64,
+    pub files: u64,
+    pub newest: SystemTime,
+    /// 子树内发现的、使整项不适合删除的原因（受保护名称、云占位文件等）。
+    pub blocker: Option<PlanSkipReason>,
+}
+
+/// 统计 `path` 的大小、文件数与最新修改时间，并检查是否含受保护内容。不跟随链接。
+pub fn measure_path(path: &Path) -> std::io::Result<TreeStats> {
+    let meta = fs::symlink_metadata(path)?;
+    let m = measure(path, &meta, 0);
+    Ok(TreeStats {
+        size: m.size,
+        files: m.files,
+        newest: m.newest,
+        blocker: m.blocker,
+    })
+}

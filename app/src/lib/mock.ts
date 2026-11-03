@@ -1,5 +1,5 @@
 // 仅用于在普通浏览器里预览/截图界面，不会进入发布版。
-import type { Api, Child, CleanProgress, DupGroup, DupProgress, DupSummary, PlanSummary, Report, Rule, ScanProgress, Settings } from './types';
+import type { Api, AppInfo, Child, Leftover, CleanProgress, DupGroup, DupProgress, DupSummary, PlanSummary, Report, Rule, ScanProgress, Settings } from './types';
 
 const GB = 1024 ** 3;
 const MB = 1024 ** 2;
@@ -29,6 +29,26 @@ let cancelScan = false;
 let cancelClean = false;
 const listeners = { scan: new Set<(p: ScanProgress) => void>(), clean: new Set<(p: CleanProgress) => void>(), dup: new Set<(p: DupProgress) => void>() };
 let cancelDup = false;
+
+const apps: AppInfo[] = [
+  { id: 0, name: '7-Zip 23.01 (x64)', version: '23.01', publisher: 'Igor Pavlov', install_date: '2024-02-11', size_kb: 5_400, install_location: 'C:\\Program Files\\7-Zip', kind: 'desktop', can_uninstall: true, uninstall_command: '"C:\\Program Files\\7-Zip\\Uninstall.exe"' },
+  { id: 1, name: 'Adobe Acrobat Reader', version: '24.002', publisher: 'Adobe', install_date: '2024-05-02', size_kb: 612_000, install_location: 'C:\\Program Files\\Adobe\\Acrobat Reader', kind: 'desktop', can_uninstall: true, uninstall_command: 'MsiExec.exe /X{AC76BA86-7AD7-1033-7B44-AC0F074E4100}' },
+  { id: 2, name: 'Foo Editor', version: '2.1', publisher: 'Acme Inc.', install_date: '2023-11-20', size_kb: 148_000, install_location: 'C:\\Program Files\\Foo Editor', kind: 'desktop', can_uninstall: true, uninstall_command: '"C:\\Program Files\\Foo Editor\\unins000.exe" /SILENT' },
+  { id: 3, name: 'Old Broken Tool', version: '0.9', publisher: 'Legacy Soft', install_date: '2019-03-14', size_kb: 12_000, install_location: null, kind: 'desktop', can_uninstall: false, uninstall_command: null },
+  { id: 4, name: 'Visual Studio Code', version: '1.95', publisher: 'Microsoft Corporation', install_date: '2024-10-30', size_kb: 390_000, install_location: 'C:\\Users\\alice\\AppData\\Local\\Programs\\Microsoft VS Code', kind: 'desktop', can_uninstall: true, uninstall_command: '"C:\\Users\\alice\\AppData\\Local\\Programs\\Microsoft VS Code\\unins000.exe"' },
+  { id: 5, name: 'Contoso.Notes', version: '1.0.0.0', publisher: 'CN=Contoso', install_date: null, size_kb: null, install_location: null, kind: 'store', can_uninstall: true, uninstall_command: null },
+];
+let uninstalledFoo = false;
+const leftoverSample: Leftover[] = [
+  { id: 0, kind: 'folder', path: 'C:\\Program Files\\Foo Editor', value_name: null, confidence: 'high', reason: 'install_location', size: 148 * MB, files: 1_204, default_selected: true },
+  { id: 1, kind: 'folder', path: 'C:\\Users\\alice\\AppData\\Roaming\\FooEditor', value_name: null, confidence: 'high', reason: 'name_match', size: 12 * MB, files: 88, default_selected: true },
+  { id: 2, kind: 'folder', path: 'C:\\ProgramData\\Foo', value_name: null, confidence: 'medium', reason: 'name_match', size: 2 * MB, files: 6, default_selected: false },
+  { id: 3, kind: 'file', path: 'C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Foo Editor.lnk', value_name: null, confidence: 'high', reason: 'shortcut', size: 1_200, files: 1, default_selected: true },
+  { id: 4, kind: 'reg_key', path: 'HKLM\\SOFTWARE\\Acme\\Foo Editor', value_name: null, confidence: 'high', reason: 'name_match', size: 0, files: 0, default_selected: true },
+  { id: 5, kind: 'reg_key', path: 'HKLM\\SOFTWARE\\Classes\\CLSID\\{3F2504E0-4F89-11D3-9A0C-0305E82C3301}', value_name: null, confidence: 'high', reason: 'com_registration', size: 0, files: 0, default_selected: true },
+  { id: 6, kind: 'reg_value', path: 'HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run', value_name: 'FooEditorTray', confidence: 'high', reason: 'auto_run', size: 0, files: 0, default_selected: true },
+  { id: 7, kind: 'reg_key', path: 'HKLM\\SYSTEM\\CurrentControlSet\\Services\\FooUpdater', value_name: null, confidence: 'medium', reason: 'stale_service', size: 0, files: 0, default_selected: false },
+];
 
 const t0 = 1_700_000_000;
 let dupGroups: DupGroup[] = [
@@ -173,6 +193,51 @@ export const mockApi: Api = {
     await sleep(900);
     if (id === 'shadow_copy') throw { code: 'sys_failed', detail: 'command_failed: vssadmin.exe exited with 1: No items found that satisfy the query.' };
     return { id, free_before: 38 * GB, free_after: 44 * GB, output: '' };
+  },
+  async appsList(includeStore) {
+    await sleep(300);
+    return apps.filter((a) => includeStore || a.kind === 'desktop');
+  },
+  async appUninstall(id) {
+    await sleep(1800);
+    if (id === 2) uninstalledFoo = true;
+    return { exit_code: 0, still_registered: id !== 2 };
+  },
+  async appLeftovers(id, forced) {
+    await sleep(900);
+    if (id !== 2) {
+      // 其他程序：未强制时仍登记着；强制时给出它自己的登记项和目录。
+      if (!forced) return { items: [], still_registered: true, install_dir: null, total_size: 0 };
+      const items = [
+        { id: 0, kind: 'folder' as const, path: 'C:\\Program Files\\Legacy Soft\\Old Broken Tool', value_name: null, confidence: 'high' as const, reason: 'name_match', size: 12 * MB, files: 40, default_selected: true },
+        { id: 1, kind: 'reg_key' as const, path: 'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\OldBrokenTool', value_name: null, confidence: 'high' as const, reason: 'uninstall_entry', size: 0, files: 0, default_selected: true },
+      ];
+      return { items, still_registered: true, install_dir: null, total_size: 12 * MB };
+    }
+    if (!uninstalledFoo && !forced) return { items: [], still_registered: true, install_dir: null, total_size: 0 };
+    const items = forced
+      ? [...leftoverSample, { id: 8, kind: 'reg_key' as const, path: 'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Foo Editor', value_name: null, confidence: 'high' as const, reason: 'uninstall_entry', size: 0, files: 0, default_selected: true }]
+      : leftoverSample;
+    return { items, still_registered: !uninstalledFoo, install_dir: 'C:\\Program Files\\Foo Editor', total_size: items.reduce((a, i) => a + i.size, 0) };
+  },
+  async appDeleteLeftovers(selected, recycle) {
+    await sleep(700);
+    const chosen = leftoverSample.filter((i) => selected.includes(i.id));
+    const files = chosen.filter((i) => i.kind === 'folder' || i.kind === 'file');
+    const freed = files.reduce((a, i) => a + i.size, 0);
+    return {
+      registry: chosen.filter((i) => i.kind.startsWith('reg')).map((i) => ({
+        path: i.path, value_name: i.value_name,
+        status: i.reason === 'stale_service' ? 'refused' as const : 'deleted' as const,
+        detail: i.reason === 'stale_service' ? 'changed since the scan' : null,
+      })),
+      files: {
+        dry_run: false, freed_bytes: recycle ? 0 : freed, recycled_bytes: recycle ? freed : 0,
+        deleted: recycle ? 0 : files.length, recycled: recycle ? files.length : 0, would_delete: 0,
+        failed: 0, refused: 0, cancelled: false, problems: [], service_errors: [], journal_path: 'C:\\Users\\alice\\AppData\\Roaming\\com.kurlez.diskcleaner\\journal.jsonl',
+      },
+      backup_file: 'C:\\Users\\alice\\AppData\\Roaming\\com.kurlez.diskcleaner\\registry-backups\\20241103-120000-Foo_Editor.reg',
+    };
   },
   async onDupProgress(cb) { listeners.dup.add(cb); return () => listeners.dup.delete(cb); },
   async onScanProgress(cb) { listeners.scan.add(cb); return () => listeners.scan.delete(cb); },

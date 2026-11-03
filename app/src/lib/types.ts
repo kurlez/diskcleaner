@@ -42,6 +42,21 @@ export interface DupSelection { group: number; file: number }
 export interface SysAction { id: string; risk: Risk; estimate: number | null }
 export interface SysResult { id: string; free_before: number | null; free_after: number | null; output: string }
 
+export interface AppInfo {
+  id: number; name: string; version: string | null; publisher: string | null;
+  install_date: string | null; size_kb: number | null; install_location: string | null;
+  kind: 'desktop' | 'store'; can_uninstall: boolean; uninstall_command: string | null;
+}
+export interface UninstallRun { exit_code: number; still_registered: boolean }
+export interface Leftover {
+  id: number; kind: 'folder' | 'file' | 'reg_key' | 'reg_value'; path: string;
+  value_name: string | null; confidence: 'high' | 'medium'; reason: string;
+  size: number; files: number; default_selected: boolean;
+}
+export interface Leftovers { items: Leftover[]; still_registered: boolean; install_dir: string | null; total_size: number }
+export interface RegResult { path: string; value_name: string | null; status: 'deleted' | 'missing' | 'refused' | 'failed'; detail: string | null }
+export interface LeftoverReport { registry: RegResult[]; files: Report; backup_file: string | null }
+
 export interface ApiError { code: string; detail?: string | null }
 
 export interface Api {
@@ -63,6 +78,10 @@ export interface Api {
   dupDelete(selections: DupSelection[], recycle: boolean): Promise<Report>;
   sysList(): Promise<SysAction[]>;
   sysRun(id: string): Promise<SysResult>;
+  appsList(includeStore: boolean): Promise<AppInfo[]>;
+  appUninstall(id: number, silent: boolean): Promise<UninstallRun>;
+  appLeftovers(id: number, forced: boolean): Promise<Leftovers>;
+  appDeleteLeftovers(selected: number[], recycle: boolean): Promise<LeftoverReport>;
   onDupProgress(cb: (p: DupProgress) => void): Promise<() => void>;
   onScanProgress(cb: (p: ScanProgress) => void): Promise<() => void>;
   onCleanProgress(cb: (p: CleanProgress) => void): Promise<() => void>;

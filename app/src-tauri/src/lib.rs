@@ -5,13 +5,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use diskclean_core::builtin::windows_rules;
+use diskclean_core::registry::Registry;
 use diskclean_core::rules::Env;
 use diskclean_core::safety::{KnownDirs, SafetyPolicy};
+use diskclean_core::uninstall::{self, FsRoots};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use service::{
-    ApiError, ChildrenDto, DriveDto, DupSelection, DupSummary, ExecRequest, PlanSummary, ReportDto,
-    RuleDto, ScanSummary, Service, SysActionDto, SysResultDto,
+    ApiError, AppDto, ChildrenDto, DriveDto, DupSelection, DupSummary, ExecRequest,
+    LeftoverReportDto, LeftoversDto, PlanSummary, ReportDto, RuleDto, ScanSummary, Service,
+    SysActionDto, SysResultDto, UninstallRunDto,
 };
 use settings::Settings;
 
@@ -20,6 +23,7 @@ struct AppState {
     settings: Mutex<Settings>,
     settings_path: PathBuf,
     journal_path: PathBuf,
+    backup_dir: PathBuf,
 }
 
 /// Windows 下优先用 MFT 快速扫描；失败（非管理员、非 NTFS 等）由服务层回退到遍历。
@@ -83,6 +87,25 @@ fn windows_selected_policy(exclusions: &[String]) -> Result<SafetyPolicy, ApiErr
     let dirs = KnownDirs::from_env().ok_or(ApiError::new("unsupported_platform"))?;
     let policy = SafetyPolicy::for_user_selected(&dirs).map_err(|e| ApiError::with("policy", e))?;
     with_exclusions(policy, exclusions)
+}
+
+/// 删除卸载残留时的策略：默认保护名单 + 应用常驻目录的内部 + 用户排除项。
+fn windows_leftover_policy(exclusions: &[String]) -> Result<SafetyPolicy, ApiError> {
+    let dirs = KnownDirs::from_env().ok_or(ApiError::new("unsupported_platform"))?;
+    let roots = FsRoots::from_env(&Env::from_process());
+    let policy =
+        uninstall::leftover_policy(&dirs, &roots).map_err(|e| ApiError::with("policy", e))?;
+    with_exclusions(policy, exclusions)
+}
+
+#[cfg(windows)]
+fn real_registry() -> Arc<dyn Registry> {
+    Arc::new(diskclean_core::registry::WinRegistry)
+}
+
+#[cfg(not(windows))]
+fn real_registry() -> Arc<dyn Registry> {
+    Arc::new(diskclean_core::registry::NoRegistry)
 }
 
 async fn blocking<T, F>(f: F) -> Result<T, ApiError>
@@ -247,6 +270,48 @@ async fn sys_run(state: State<'_, AppState>, id: String) -> Result<SysResultDto,
 }
 
 #[tauri::command]
+async fn apps_list(
+    state: State<'_, AppState>,
+    include_store: bool,
+) -> Result<Vec<AppDto>, ApiError> {
+    let svc = state.svc.clone();
+    blocking(move || svc.apps_list(include_store)).await
+}
+
+#[tauri::command]
+async fn app_uninstall(
+    state: State<'_, AppState>,
+    id: usize,
+    silent: bool,
+) -> Result<UninstallRunDto, ApiError> {
+    let svc = state.svc.clone();
+    blocking(move || svc.app_uninstall(id, silent)).await
+}
+
+#[tauri::command]
+async fn app_leftovers(
+    state: State<'_, AppState>,
+    id: usize,
+    forced: bool,
+) -> Result<LeftoversDto, ApiError> {
+    let svc = state.svc.clone();
+    let exclusions = state.settings.lock().unwrap().exclusions.clone();
+    blocking(move || svc.app_leftovers(id, forced, &exclusions)).await
+}
+
+#[tauri::command]
+async fn app_delete_leftovers(
+    state: State<'_, AppState>,
+    selected: Vec<usize>,
+    recycle: bool,
+) -> Result<LeftoverReportDto, ApiError> {
+    let svc = state.svc.clone();
+    let backup = state.backup_dir.clone();
+    let journal = state.journal_path.clone();
+    blocking(move || svc.app_delete_leftovers(&selected, recycle, &backup, &journal)).await
+}
+
+#[tauri::command]
 fn settings_get(state: State<'_, AppState>) -> Settings {
     state.settings.lock().unwrap().clone()
 }
@@ -284,12 +349,18 @@ pub fn run() {
             .with_system(
                 Arc::new(diskclean_core::sysaction::SystemRunner),
                 Box::new(windows_selected_policy),
+            )
+            .with_uninstall(
+                real_registry(),
+                Box::new(windows_leftover_policy),
+                FsRoots::from_env(&Env::from_process()),
             );
             app.manage(AppState {
                 svc: Arc::new(svc),
                 settings: Mutex::new(settings),
                 settings_path,
                 journal_path: data_dir.join("journal.jsonl"),
+                backup_dir: data_dir.join("registry-backups"),
             });
             Ok(())
         })
@@ -310,6 +381,10 @@ pub fn run() {
             dup_delete,
             sys_list,
             sys_run,
+            apps_list,
+            app_uninstall,
+            app_leftovers,
+            app_delete_leftovers,
             settings_get,
             settings_set_exclusions,
         ])

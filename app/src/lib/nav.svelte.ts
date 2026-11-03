@@ -1,4 +1,4 @@
-export type View = 'dashboard' | 'scan' | 'duplicates' | 'clean' | 'settings';
+export type View = 'dashboard' | 'scan' | 'duplicates' | 'uninstall' | 'clean' | 'settings';
 
 /** 跨页面共享的导航状态。`scanRequest` 每增加一次，分析页就用 `scanPath` 自动开始扫描。 */
 export const nav = $state<{ view: View; scanPath: string; scanRequest: number }>({

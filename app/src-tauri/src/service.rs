@@ -13,10 +13,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use diskclean_core::cleaner::{execute_with, ExecOptions, Report, Status};
 use diskclean_core::duplicates::{self, DupGroup, DupOptions, DupOutcome, DupPhase};
 use diskclean_core::plan::{build_plan, Candidate, Plan, PlanSkipReason};
+use diskclean_core::registry::{Hive, NoRegistry, Registry};
 use diskclean_core::rules::{Disposal, Env, Risk, Rule};
 use diskclean_core::safety::SafetyPolicy;
 use diskclean_core::scanner::{self, Node, Progress, ScanOutcome};
 use diskclean_core::sysaction::{self, CommandRunner, ScServices, SystemRunner};
+use diskclean_core::uninstall::{
+    self, AppSource, Confidence, DeleteCtx, DeleteError, FsRoots, InstalledApp, Leftover,
+    LeftoverScan, Reason, RegStatus, Target, UninstallError,
+};
 use serde::Serialize;
 
 const MAX_CHILDREN: usize = 1000;
@@ -242,6 +247,74 @@ pub struct ExecRequest {
     pub recycle: bool,
 }
 
+// ---------- 应用卸载 DTO ----------
+
+#[derive(Debug, Serialize)]
+pub struct AppDto {
+    /// 在后端保存的列表里的序号；之后的操作只传这个序号。
+    pub id: usize,
+    pub name: String,
+    pub version: Option<String>,
+    pub publisher: Option<String>,
+    /// `YYYY-MM-DD`；登记里没有或格式不对时为空。
+    pub install_date: Option<String>,
+    pub size_kb: Option<u64>,
+    pub install_location: Option<String>,
+    /// `desktop` 或 `store`。
+    pub kind: &'static str,
+    /// 有可用的卸载命令（Store 应用总是可以）。没有时只能"强制删除"。
+    pub can_uninstall: bool,
+    /// 将要运行的卸载命令，供用户在确认前查看。
+    pub uninstall_command: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UninstallRunDto {
+    pub exit_code: i32,
+    pub still_registered: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LeftoverDto {
+    pub id: usize,
+    /// `folder` / `file` / `reg_key` / `reg_value`
+    pub kind: &'static str,
+    /// 文件路径，或带根的注册表路径（如 `HKLM\SOFTWARE\Foo`）。
+    pub path: String,
+    pub value_name: Option<String>,
+    pub confidence: &'static str,
+    pub reason: &'static str,
+    pub size: u64,
+    pub files: u64,
+    /// 高置信度的默认勾选。
+    pub default_selected: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LeftoversDto {
+    pub items: Vec<LeftoverDto>,
+    pub still_registered: bool,
+    pub install_dir: Option<String>,
+    pub total_size: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegResultDto {
+    pub path: String,
+    pub value_name: Option<String>,
+    /// `deleted` / `missing` / `refused` / `failed`
+    pub status: &'static str,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LeftoverReportDto {
+    pub registry: Vec<RegResultDto>,
+    pub files: ReportDto,
+    /// 注册表备份文件，可双击导入恢复。
+    pub backup_file: Option<String>,
+}
+
 // ---------- Service ----------
 
 pub type PolicyFactory = dyn Fn(&[String]) -> Result<SafetyPolicy> + Send + Sync;
@@ -274,6 +347,17 @@ pub struct Service {
     scan_cancel: Arc<AtomicBool>,
     clean_cancel: Arc<AtomicBool>,
     dup_cancel: Arc<AtomicBool>,
+    registry: Arc<dyn Registry>,
+    leftover_policy_factory: Arc<PolicyFactory>,
+    fs_roots: FsRoots,
+    apps: Mutex<Vec<InstalledApp>>,
+    leftovers: Mutex<Option<LeftoverState>>,
+}
+
+struct LeftoverState {
+    app_name: String,
+    scan: LeftoverScan,
+    policy: SafetyPolicy,
 }
 
 impl Service {
@@ -284,6 +368,7 @@ impl Service {
         fast_scan: Option<Box<FastScanFn>>,
     ) -> Self {
         let policy_factory: Arc<PolicyFactory> = Arc::from(policy_factory);
+        let policy_factory_for_leftovers = policy_factory.clone();
         Self {
             rules,
             env,
@@ -297,7 +382,25 @@ impl Service {
             scan_cancel: Arc::new(AtomicBool::new(false)),
             clean_cancel: Arc::new(AtomicBool::new(false)),
             dup_cancel: Arc::new(AtomicBool::new(false)),
+            registry: Arc::new(NoRegistry),
+            leftover_policy_factory: policy_factory_for_leftovers,
+            fs_roots: FsRoots::default(),
+            apps: Mutex::new(Vec::new()),
+            leftovers: Mutex::new(None),
         }
+    }
+
+    /// 注入注册表、残留文件的安全策略与扫描位置（生产环境与测试各自提供）。
+    pub fn with_uninstall(
+        mut self,
+        registry: Arc<dyn Registry>,
+        leftover_policy_factory: Box<PolicyFactory>,
+        fs_roots: FsRoots,
+    ) -> Self {
+        self.registry = registry;
+        self.leftover_policy_factory = Arc::from(leftover_policy_factory);
+        self.fs_roots = fs_roots;
+        self
     }
 
     /// 替换外部命令执行器与"用户选中文件"策略（生产环境与测试各自注入）。
@@ -654,6 +757,154 @@ impl Service {
             .ok_or(ApiError::new("no_scan"))
     }
 
+    // ----- 应用卸载 -----
+
+    /// 列出已装程序（传统程序 + Store 应用）。Store 应用的枚举失败不影响传统程序。
+    pub fn apps_list(&self, include_store: bool) -> Result<Vec<AppDto>> {
+        if let Err(e) = self.registry.subkeys(Hive::LocalMachine, "SOFTWARE") {
+            if e.kind() == std::io::ErrorKind::Unsupported {
+                return Err(ApiError::new("unsupported_platform"));
+            }
+        }
+        let mut apps = uninstall::enumerate_apps(self.registry.as_ref());
+        if include_store {
+            if let Ok(out) = self.runner.run("powershell.exe", uninstall::APPX_LIST_ARGS) {
+                if out.code == 0 {
+                    apps.extend(uninstall::parse_appx_json(&out.stdout));
+                }
+            }
+        }
+        let dtos = apps
+            .iter()
+            .enumerate()
+            .map(|(i, a)| app_dto(i, a))
+            .collect();
+        *self.apps.lock().unwrap() = apps;
+        *self.leftovers.lock().unwrap() = None;
+        Ok(dtos)
+    }
+
+    fn app_by_id(&self, id: usize) -> Result<InstalledApp> {
+        self.apps
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| ApiError::with("unknown_app", id))
+    }
+
+    /// 运行程序自带的卸载器并等待它结束。
+    pub fn app_uninstall(&self, id: usize, silent: bool) -> Result<UninstallRunDto> {
+        let app = self.app_by_id(id)?;
+        let run =
+            uninstall::run_uninstaller(&app, silent, self.runner.as_ref(), self.registry.as_ref())
+                .map_err(|e| match e {
+                    UninstallError::NoUninstaller => ApiError::new("no_uninstaller"),
+                    UninstallError::InvalidCommand => ApiError::new("invalid_command"),
+                    UninstallError::Failed(m) => ApiError::with("uninstall_failed", m),
+                })?;
+        Ok(UninstallRunDto {
+            exit_code: run.exit_code,
+            still_registered: run.still_registered,
+        })
+    }
+
+    /// 扫描程序卸载后残留的文件和注册表项。
+    pub fn app_leftovers(
+        &self,
+        id: usize,
+        forced: bool,
+        exclusions: &[String],
+    ) -> Result<LeftoversDto> {
+        let app = self.app_by_id(id)?;
+        let policy = (self.leftover_policy_factory)(exclusions)?;
+        let scan = uninstall::scan_leftovers(
+            &app,
+            &self.fs_roots,
+            &self.env,
+            self.registry.as_ref(),
+            &policy,
+            forced,
+        );
+        let dto = leftovers_dto(&scan);
+        *self.leftovers.lock().unwrap() = Some(LeftoverState {
+            app_name: app.name.clone(),
+            scan,
+            policy,
+        });
+        Ok(dto)
+    }
+
+    /// 删除用户勾选的残留。前端只传序号；注册表先备份，备份失败则什么都不删。
+    pub fn app_delete_leftovers(
+        &self,
+        selected: &[usize],
+        recycle: bool,
+        backup_dir: &Path,
+        journal_path: &Path,
+    ) -> Result<LeftoverReportDto> {
+        if selected.is_empty() {
+            return Err(ApiError::new("nothing_selected"));
+        }
+        let guard = self.leftovers.lock().unwrap();
+        let state = guard.as_ref().ok_or(ApiError::new("no_scan"))?;
+        let mut items: Vec<Leftover> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for &i in selected {
+            let item = state
+                .scan
+                .items
+                .get(i)
+                .ok_or_else(|| ApiError::with("invalid_selection", i))?;
+            if seen.insert(i) {
+                items.push(item.clone());
+            }
+        }
+        let mut journal = open_journal(journal_path)?;
+        self.clean_cancel.store(false, Ordering::Relaxed);
+        let ctx = DeleteCtx {
+            reg: self.registry.as_ref(),
+            env: &self.env,
+            policy: &state.policy,
+            backup_dir,
+            app_name: &state.app_name,
+            disposal: if recycle {
+                Disposal::Recycle
+            } else {
+                Disposal::Permanent
+            },
+            cancel: &self.clean_cancel,
+        };
+        let out = uninstall::delete_leftovers(&items, &ctx, Some(&mut journal as &mut dyn Write))
+            .map_err(|e| match e {
+            DeleteError::BackupFailed(m) => ApiError::with("backup_failed", m),
+        })?;
+        drop(guard);
+        *self.leftovers.lock().unwrap() = None;
+        Ok(LeftoverReportDto {
+            registry: out
+                .registry
+                .iter()
+                .map(|r| {
+                    let (status, detail) = match &r.status {
+                        RegStatus::Deleted => ("deleted", None),
+                        RegStatus::Missing => ("missing", None),
+                        RegStatus::Refused(d) => ("refused", Some(d.clone())),
+                        RegStatus::Failed(d) => ("failed", Some(d.clone())),
+                    };
+                    RegResultDto {
+                        path: format!("{}\\{}", r.hive.short_name(), r.path),
+                        value_name: r.value.clone(),
+                        status,
+                        detail,
+                    }
+                })
+                .collect(),
+            files: report_dto(&out.files, false, journal_path),
+            backup_file: out.backup_file.as_deref().map(display_path),
+        })
+    }
+
     // ----- 系统动作 -----
 
     pub fn sys_list(&self) -> Vec<SysActionDto> {
@@ -697,6 +948,103 @@ impl Service {
                 format!("{}: {}", e.code, e.detail),
             )),
         }
+    }
+}
+
+fn format_install_date(raw: &Option<String>) -> Option<String> {
+    let r = raw.as_deref()?;
+    (r.len() == 8 && r.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| format!("{}-{}-{}", &r[..4], &r[4..6], &r[6..8]))
+}
+
+fn app_dto(id: usize, a: &InstalledApp) -> AppDto {
+    let store = matches!(a.source, AppSource::Appx { .. });
+    let command = (!store)
+        .then(|| uninstall::uninstall_command(a, false).ok())
+        .flatten();
+    AppDto {
+        id,
+        name: a.name.clone(),
+        version: a.version.clone(),
+        publisher: a.publisher.clone(),
+        install_date: format_install_date(&a.install_date),
+        size_kb: a.size_kb,
+        install_location: a.install_location.clone(),
+        kind: if store { "store" } else { "desktop" },
+        can_uninstall: store || command.is_some(),
+        uninstall_command: command,
+    }
+}
+
+fn leftovers_dto(scan: &LeftoverScan) -> LeftoversDto {
+    let reason = |r: Reason| match r {
+        Reason::InstallLocation => "install_location",
+        Reason::NameMatch => "name_match",
+        Reason::PublisherEmptied => "publisher_emptied",
+        Reason::UninstallEntry => "uninstall_entry",
+        Reason::AppPath => "app_path",
+        Reason::AutoRun => "auto_run",
+        Reason::StaleService => "stale_service",
+        Reason::ComRegistration => "com_registration",
+        Reason::Shortcut => "shortcut",
+    };
+    let items: Vec<LeftoverDto> = scan
+        .items
+        .iter()
+        .enumerate()
+        .map(|(id, l)| {
+            let (kind, path, value_name, size, files) = match &l.target {
+                Target::Path {
+                    path,
+                    is_dir,
+                    size,
+                    files,
+                } => (
+                    if *is_dir { "folder" } else { "file" },
+                    display_path(path),
+                    None,
+                    *size,
+                    *files,
+                ),
+                Target::Key { hive, path, .. } => (
+                    "reg_key",
+                    format!("{}\\{path}", hive.short_name()),
+                    None,
+                    0,
+                    0,
+                ),
+                Target::Value {
+                    hive, path, name, ..
+                } => (
+                    "reg_value",
+                    format!("{}\\{path}", hive.short_name()),
+                    Some(name.clone()),
+                    0,
+                    0,
+                ),
+            };
+            LeftoverDto {
+                id,
+                kind,
+                path,
+                value_name,
+                confidence: if l.confidence == Confidence::High {
+                    "high"
+                } else {
+                    "medium"
+                },
+                reason: reason(l.reason),
+                size,
+                files,
+                default_selected: l.confidence == Confidence::High,
+            }
+        })
+        .collect();
+    LeftoversDto {
+        total_size: items.iter().map(|i| i.size).sum(),
+        items,
+        still_registered: scan.still_registered,
+        install_dir: scan.install_dir.as_deref().map(display_path),
     }
 }
 
@@ -1495,6 +1843,440 @@ mod tests {
         assert!(rep.service_errors.is_empty());
         assert_eq!(runner.calls().last().unwrap(), "sc.exe start wuauserv");
         assert_eq!(runner.calls()[1], "sc.exe stop wuauserv");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    // ---------- 应用卸载 ----------
+
+    use diskclean_core::registry::MemRegistry;
+    use diskclean_core::uninstall::FsRoots;
+
+    const UNINSTALL: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+
+    /// 模拟卸载器：运行时执行一个回调（比如删掉注册表里的登记项）。
+    struct ShellRunner {
+        lines: Mutex<Vec<String>>,
+        on_run: Box<dyn Fn() + Send + Sync>,
+        powershell: Mutex<VecDeque<CmdOutput>>,
+    }
+
+    impl ShellRunner {
+        fn new(on_run: impl Fn() + Send + Sync + 'static) -> Arc<Self> {
+            Arc::new(Self {
+                lines: Mutex::default(),
+                on_run: Box::new(on_run),
+                powershell: Mutex::default(),
+            })
+        }
+        fn with_powershell(self: Arc<Self>, out: CmdOutput) -> Arc<Self> {
+            self.powershell.lock().unwrap().push_back(out);
+            self
+        }
+    }
+
+    impl CommandRunner for ShellRunner {
+        fn run(&self, _p: &str, _a: &[&str]) -> std::io::Result<CmdOutput> {
+            Ok(self
+                .powershell
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default())
+        }
+        fn run_shell(&self, line: &str) -> std::io::Result<CmdOutput> {
+            self.lines.lock().unwrap().push(line.to_string());
+            (self.on_run)();
+            Ok(CmdOutput::default())
+        }
+    }
+
+    fn roots_in(base: &Path) -> FsRoots {
+        let mk = |p: &str| {
+            let d = base.join(p);
+            fs::create_dir_all(&d).unwrap();
+            d
+        };
+        FsRoots {
+            program_files: vec![mk("PF")],
+            program_data: Some(mk("PD")),
+            roaming: Some(mk("Roaming")),
+            local: Some(mk("Local")),
+            local_low: None,
+            local_programs: None,
+            start_menu: vec![],
+            desktops: vec![],
+        }
+    }
+
+    fn app_service(base: &Path, reg: Arc<MemRegistry>, runner: Arc<dyn CommandRunner>) -> Service {
+        let base_s = base.to_string_lossy().into_owned();
+        let factory: Box<PolicyFactory> = Box::new(move |excl: &[String]| {
+            let mut p = SafetyPolicy::empty(PathStyle::Posix);
+            p.protect(&format!("{base_s}/Windows"))
+                .map_err(|e| ApiError::with("policy", e))?;
+            for x in excl {
+                p.exclude(x)
+                    .map_err(|e| ApiError::with("invalid_exclusion", e))?;
+            }
+            Ok(p)
+        });
+        Service::new(
+            vec![],
+            Env::from_pairs([("SystemDrive", base.to_string_lossy())]),
+            posix_factory(base, None),
+            None,
+        )
+        .with_system(runner, posix_factory(base, None))
+        .with_uninstall(reg, factory, roots_in(base))
+    }
+
+    /// 一个装在 PF/Foo 里、带卸载命令的程序，以及它在文件和注册表里的各种痕迹。
+    fn install_foo(d: &Path, reg: &MemRegistry) {
+        let key = format!("{UNINSTALL}\\Foo");
+        reg.set_sz(Hive::LocalMachine, &key, "DisplayName", "Foo");
+        reg.set_sz(Hive::LocalMachine, &key, "DisplayVersion", "2.1");
+        reg.set_sz(Hive::LocalMachine, &key, "Publisher", "Acme Inc.");
+        reg.set_sz(Hive::LocalMachine, &key, "InstallDate", "20240131");
+        reg.set_sz(
+            Hive::LocalMachine,
+            &key,
+            "InstallLocation",
+            &d.join("PF/Foo").to_string_lossy(),
+        );
+        reg.set_sz(
+            Hive::LocalMachine,
+            &key,
+            "UninstallString",
+            r#""C:\Program Files\Foo\unins000.exe" /SILENT"#,
+        );
+        reg.set_sz(Hive::LocalMachine, r"SOFTWARE\Acme\Foo", "Version", "2.1");
+        reg.set_sz(Hive::LocalMachine, r"SOFTWARE\Foo", "Shared", "1");
+        reg.set_sz(
+            Hive::CurrentUser,
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+            "FooTray",
+            &format!(r#""{}\tray.exe""#, d.join("PF/Foo").display()),
+        );
+        write(&d.join("PF/Foo/foo.exe"), 100);
+        write(&d.join("Roaming/Foo/settings.json"), 30);
+        write(&d.join("PF/Bar/bar.exe"), 10);
+    }
+
+    fn foo_remover(reg: &Arc<MemRegistry>) -> Arc<ShellRunner> {
+        let r = reg.clone();
+        ShellRunner::new(move || {
+            let _ = r.delete_key(Hive::LocalMachine, &format!("{UNINSTALL}\\Foo"));
+        })
+    }
+
+    #[test]
+    fn lists_desktop_and_store_apps_with_friendly_fields() {
+        let d = sandbox();
+        let reg = Arc::new(MemRegistry::new());
+        install_foo(&d, &reg);
+        reg.set_sz(
+            Hive::CurrentUser,
+            &format!("{UNINSTALL}\\NoCmd"),
+            "DisplayName",
+            "Zzz Broken",
+        );
+        let store = CmdOutput {
+            code: 0,
+            stdout: r#"[{"Name":"Contoso.Notes","PackageFullName":"Contoso.Notes_1.0.0.0_x64__abc","Version":"1.0.0.0"}]"#.into(),
+            stderr: String::new(),
+        };
+        let svc = app_service(&d, reg.clone(), foo_remover(&reg).with_powershell(store));
+        let apps = svc.apps_list(true).unwrap();
+        // 传统程序按名称排序，Store 应用附在后面。
+        assert_eq!(
+            apps.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            ["Foo", "Zzz Broken", "Contoso.Notes"]
+        );
+        let foo = apps.iter().find(|a| a.name == "Foo").unwrap();
+        assert_eq!(foo.kind, "desktop");
+        assert_eq!(foo.install_date.as_deref(), Some("2024-01-31"));
+        assert_eq!(foo.publisher.as_deref(), Some("Acme Inc."));
+        assert!(foo.can_uninstall);
+        assert!(foo
+            .uninstall_command
+            .as_deref()
+            .unwrap()
+            .contains("unins000.exe"));
+        let broken = apps.iter().find(|a| a.name == "Zzz Broken").unwrap();
+        assert!(!broken.can_uninstall && broken.uninstall_command.is_none());
+        let notes = apps.iter().find(|a| a.name == "Contoso.Notes").unwrap();
+        assert_eq!((notes.kind, notes.can_uninstall), ("store", true));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_failing_store_listing_does_not_hide_desktop_apps() {
+        let d = sandbox();
+        let reg = Arc::new(MemRegistry::new());
+        install_foo(&d, &reg);
+        let bad = CmdOutput {
+            code: 1,
+            stdout: "boom".into(),
+            stderr: String::new(),
+        };
+        let svc = app_service(&d, reg.clone(), foo_remover(&reg).with_powershell(bad));
+        let apps = svc.apps_list(true).unwrap();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(svc.apps_list(false).unwrap().len(), 1);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn default_service_reports_unsupported_platform_for_the_registry() {
+        let d = sandbox();
+        assert_eq!(
+            service(&d).apps_list(true).unwrap_err().code,
+            "unsupported_platform"
+        );
+    }
+
+    #[test]
+    fn uninstall_scan_and_delete_end_to_end() {
+        let d = sandbox();
+        let reg = Arc::new(MemRegistry::new());
+        install_foo(&d, &reg);
+        let runner = foo_remover(&reg);
+        let svc = app_service(&d, reg.clone(), runner.clone());
+        let apps = svc.apps_list(false).unwrap();
+        let id = apps.iter().find(|a| a.name == "Foo").unwrap().id;
+
+        // 卸载前扫描：程序还登记着，不给出任何残留。
+        let early = svc.app_leftovers(id, false, &[]).unwrap();
+        assert!(early.still_registered && early.items.is_empty());
+
+        // 运行卸载器（模拟它删掉了登记项）。
+        let run = svc.app_uninstall(id, false).unwrap();
+        assert_eq!((run.exit_code, run.still_registered), (0, false));
+        assert_eq!(runner.lines.lock().unwrap().len(), 1);
+
+        let left = svc.app_leftovers(id, false, &[]).unwrap();
+        assert!(!left.still_registered);
+        let by_path = |needle: &str| {
+            left.items
+                .iter()
+                .find(|i| i.path.contains(needle) && i.value_name.is_none())
+                .unwrap_or_else(|| panic!("{needle} not found in {:#?}", left.items))
+        };
+        assert_eq!(by_path("PF/Foo").kind, "folder");
+        assert!(by_path("PF/Foo").default_selected);
+        assert!(by_path("Roaming/Foo").default_selected);
+        assert_eq!(by_path(r"HKLM\SOFTWARE\Acme\Foo").kind, "reg_key");
+        assert_eq!(by_path(r"HKLM\SOFTWARE\Acme\Foo").confidence, "high");
+        // 以程序名命名的根键把握较小：列出，但不默认勾选。
+        let owned = left
+            .items
+            .iter()
+            .find(|i| i.path == r"HKLM\SOFTWARE\Foo")
+            .unwrap();
+        assert!(!owned.default_selected && owned.confidence == "medium");
+        let run_val = left.items.iter().find(|i| i.kind == "reg_value").unwrap();
+        assert_eq!(run_val.value_name.as_deref(), Some("FooTray"));
+        assert!(
+            !left.items.iter().any(|i| i.path.contains("PF/Bar")),
+            "别的程序不能列出来"
+        );
+        assert_eq!(left.total_size, 130);
+
+        // 只删默认勾选的（高置信度）项。
+        let selected: Vec<usize> = left
+            .items
+            .iter()
+            .filter(|i| i.default_selected)
+            .map(|i| i.id)
+            .collect();
+        let bk = d.join("bk");
+        let rep = svc
+            .app_delete_leftovers(&selected, false, &bk, &d.join("j.jsonl"))
+            .unwrap();
+        assert!(
+            rep.registry.iter().all(|r| r.status == "deleted"),
+            "{:?}",
+            rep.registry
+        );
+        assert_eq!(rep.files.deleted, 2);
+        assert!(!d.join("PF/Foo").exists() && !d.join("Roaming/Foo").exists());
+        assert!(d.join("PF/Bar/bar.exe").exists());
+        assert!(!reg.key_exists(Hive::LocalMachine, r"SOFTWARE\Acme\Foo"));
+        assert!(
+            reg.key_exists(Hive::LocalMachine, r"SOFTWARE\Foo"),
+            "未勾选的中置信度项必须保留"
+        );
+        assert!(reg
+            .value(
+                Hive::CurrentUser,
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+                "FooTray"
+            )
+            .is_none());
+
+        // 备份文件可用于恢复。
+        let backup = std::path::PathBuf::from(rep.backup_file.unwrap());
+        assert!(backup.starts_with(&bk) && backup.extension().unwrap() == "reg");
+        let bytes = fs::read(&backup).unwrap();
+        assert_eq!(&bytes[..2], [0xFF, 0xFE]);
+
+        // 扫描结果已用掉，不能重复删除。
+        assert_eq!(
+            svc.app_delete_leftovers(&selected, false, &bk, &d.join("j.jsonl"))
+                .unwrap_err()
+                .code,
+            "no_scan"
+        );
+        let journal = fs::read_to_string(d.join("j.jsonl")).unwrap();
+        assert!(journal.contains("\"op\":\"registry\"") && journal.contains("\"op\":\"intent\""));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn forced_removal_works_without_running_any_uninstaller() {
+        let d = sandbox();
+        let reg = Arc::new(MemRegistry::new());
+        install_foo(&d, &reg);
+        let runner = foo_remover(&reg);
+        let svc = app_service(&d, reg.clone(), runner.clone());
+        let id = svc
+            .apps_list(false)
+            .unwrap()
+            .iter()
+            .find(|a| a.name == "Foo")
+            .unwrap()
+            .id;
+        let left = svc.app_leftovers(id, true, &[]).unwrap();
+        assert!(left.still_registered, "强制模式仍会如实告知它还登记着");
+        let entry = left
+            .items
+            .iter()
+            .find(|i| i.reason == "uninstall_entry")
+            .unwrap();
+        assert_eq!(entry.confidence, "high");
+        let all: Vec<usize> = left.items.iter().map(|i| i.id).collect();
+        svc.app_delete_leftovers(&all, true, &d.join("bk"), &d.join("j"))
+            .unwrap();
+        assert!(!reg.key_exists(Hive::LocalMachine, &format!("{UNINSTALL}\\Foo")));
+        assert!(
+            runner.lines.lock().unwrap().is_empty(),
+            "强制删除不运行卸载器"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn bad_ids_and_selections_are_rejected() {
+        let d = sandbox();
+        let reg = Arc::new(MemRegistry::new());
+        install_foo(&d, &reg);
+        reg.set_sz(
+            Hive::LocalMachine,
+            &format!("{UNINSTALL}\\Plain"),
+            "DisplayName",
+            "Plain App",
+        );
+        let svc = app_service(&d, reg.clone(), foo_remover(&reg));
+        assert_eq!(
+            svc.app_uninstall(0, false).unwrap_err().code,
+            "unknown_app",
+            "没有调用 apps_list 之前没有任何序号可用"
+        );
+        let apps = svc.apps_list(false).unwrap();
+        assert_eq!(
+            svc.app_uninstall(99, false).unwrap_err().code,
+            "unknown_app"
+        );
+        assert_eq!(
+            svc.app_leftovers(99, false, &[]).unwrap_err().code,
+            "unknown_app"
+        );
+        let plain = apps.iter().find(|a| a.name == "Plain App").unwrap().id;
+        assert_eq!(
+            svc.app_uninstall(plain, false).unwrap_err().code,
+            "no_uninstaller"
+        );
+
+        let bk = d.join("bk");
+        let j = d.join("j");
+        assert_eq!(
+            svc.app_delete_leftovers(&[0], false, &bk, &j)
+                .unwrap_err()
+                .code,
+            "no_scan"
+        );
+        let foo = apps.iter().find(|a| a.name == "Foo").unwrap().id;
+        svc.app_leftovers(foo, true, &[]).unwrap();
+        assert_eq!(
+            svc.app_delete_leftovers(&[], false, &bk, &j)
+                .unwrap_err()
+                .code,
+            "nothing_selected"
+        );
+        assert_eq!(
+            svc.app_delete_leftovers(&[999], false, &bk, &j)
+                .unwrap_err()
+                .code,
+            "invalid_selection"
+        );
+        assert!(
+            d.join("PF/Foo/foo.exe").exists(),
+            "出错的请求不能删除任何东西"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn backup_failure_stops_everything_and_is_reported() {
+        let d = sandbox();
+        let reg = Arc::new(MemRegistry::new());
+        install_foo(&d, &reg);
+        let svc = app_service(&d, reg.clone(), foo_remover(&reg));
+        let id = svc
+            .apps_list(false)
+            .unwrap()
+            .iter()
+            .find(|a| a.name == "Foo")
+            .unwrap()
+            .id;
+        svc.app_uninstall(id, false).unwrap();
+        let left = svc.app_leftovers(id, false, &[]).unwrap();
+        let all: Vec<usize> = left.items.iter().map(|i| i.id).collect();
+        let blocker = d.join("blocker");
+        write(&blocker, 1);
+        let before = reg.key_count();
+        let err = svc
+            .app_delete_leftovers(&all, false, &blocker.join("sub"), &d.join("j"))
+            .unwrap_err();
+        assert_eq!(err.code, "backup_failed");
+        assert_eq!(reg.key_count(), before);
+        assert!(d.join("PF/Foo/foo.exe").exists());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn user_exclusions_protect_leftover_files() {
+        let d = sandbox();
+        let reg = Arc::new(MemRegistry::new());
+        install_foo(&d, &reg);
+        let svc = app_service(&d, reg.clone(), foo_remover(&reg));
+        let id = svc
+            .apps_list(false)
+            .unwrap()
+            .iter()
+            .find(|a| a.name == "Foo")
+            .unwrap()
+            .id;
+        svc.app_uninstall(id, false).unwrap();
+        let excl = [d.join("Roaming/Foo").to_string_lossy().into_owned()];
+        let left = svc.app_leftovers(id, false, &excl).unwrap();
+        let all: Vec<usize> = left.items.iter().map(|i| i.id).collect();
+        let rep = svc
+            .app_delete_leftovers(&all, false, &d.join("bk"), &d.join("j"))
+            .unwrap();
+        assert!(d.join("Roaming/Foo/settings.json").exists(), "排除项优先");
+        assert_eq!(rep.files.refused, 1);
+        assert!(!d.join("PF/Foo").exists());
         fs::remove_dir_all(&d).unwrap();
     }
 }

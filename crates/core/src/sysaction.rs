@@ -28,6 +28,16 @@ pub struct CmdOutput {
 
 pub trait CommandRunner: Send + Sync {
     fn run(&self, program: &str, args: &[&str]) -> io::Result<CmdOutput>;
+
+    /// 把整行命令交给命令解释器执行（Windows 下是 `cmd.exe /D /S /C "<命令行>"`）。
+    /// 卸载程序登记的 `UninstallString` 是带引号和参数的整行命令，
+    /// 不能拆成参数数组，否则引号会被转义破坏。
+    fn run_shell(&self, _command_line: &str) -> io::Result<CmdOutput> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "run_shell is not supported",
+        ))
+    }
 }
 
 /// 真实执行外部程序。输出用有损 UTF-8 解码：我们只解析数字和英文关键字，
@@ -35,6 +45,30 @@ pub trait CommandRunner: Send + Sync {
 pub struct SystemRunner;
 
 impl CommandRunner for SystemRunner {
+    fn run_shell(&self, command_line: &str) -> io::Result<CmdOutput> {
+        #[cfg(windows)]
+        let mut cmd = {
+            use std::os::windows::process::CommandExt;
+            let mut c = std::process::Command::new("cmd.exe");
+            // /S 让 cmd 只剥掉最外层的一对引号，里面的引号原样保留。
+            c.raw_arg(format!("/D /S /C \"{command_line}\""));
+            c.creation_flags(0x0800_0000);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut cmd = {
+            let mut c = std::process::Command::new("sh");
+            c.args(["-c", command_line]);
+            c
+        };
+        let out = cmd.output()?;
+        Ok(CmdOutput {
+            code: out.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
+
     fn run(&self, program: &str, args: &[&str]) -> io::Result<CmdOutput> {
         let mut cmd = std::process::Command::new(program);
         cmd.args(args);
