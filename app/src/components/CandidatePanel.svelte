@@ -5,6 +5,7 @@
   import { formatSize } from '../lib/format';
   import { iconKind } from '../lib/fileicon';
   import { errorText, t } from '../lib/i18n.svelte';
+  import { goMigrate } from '../lib/nav.svelte';
   import type { CandResolved, Report } from '../lib/types';
   import Icon from './Icon.svelte';
 
@@ -44,6 +45,11 @@
       busy = false;
     }
   }
+
+  // 只有一个有效的目录候选时，可以直接把它交给"目录迁移"。
+  const migratable = $derived(
+    info.effective.length === 1 && info.effective[0].is_dir ? (resolved[info.effective[0].key]?.path ?? null) : null,
+  );
 
   const skipped = (c: { key: string }) => resolved[c.key] && (!resolved[c.key].exists || resolved[c.key].is_link);
 </script>
@@ -96,6 +102,7 @@
       <label class="opt"><input type="checkbox" bind:checked={recycle} />{t('cand.recycle')}</label>
       <label class="opt confirm"><input type="checkbox" bind:checked={confirmed} />{t('cand.confirm')}</label>
       <div class="row"><span class="grow"></span>
+        {#if migratable}<button onclick={() => goMigrate(migratable!)} disabled={busy}>{t('cand.migrate')}</button>{/if}
         <button class={recycle ? 'primary' : 'danger'} disabled={!confirmed || busy || info.effective.length === 0} onclick={remove}>
           {busy ? t('cand.deleting') : t('cand.delete')}
         </button>

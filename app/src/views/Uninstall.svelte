@@ -3,6 +3,7 @@
   import { api } from '../lib/api';
   import { formatSize } from '../lib/format';
   import { errorText, t } from '../lib/i18n.svelte';
+  import { goMigrate } from '../lib/nav.svelte';
   import Icon from '../components/Icon.svelte';
   import { iconKind, type IconKind } from '../lib/fileicon';
   import type { AppInfo, Leftover, LeftoverReport, Leftovers } from '../lib/types';
@@ -197,6 +198,9 @@
             <button class="primary" onclick={() => pick(a, false)}>{t('un.uninstall')}</button>
           {:else}
             <span class="muted small">{t('un.noInstaller')}</span>
+          {/if}
+          {#if a.kind === 'desktop' && a.install_location}
+            <button onclick={() => goMigrate(a.install_location!)}>{t('un.migrate')}</button>
           {/if}
           {#if a.kind === 'desktop'}<button onclick={() => pick(a, true)}>{t('un.force')}</button>{/if}
         </li>

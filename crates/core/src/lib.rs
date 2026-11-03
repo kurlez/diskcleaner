@@ -4,6 +4,7 @@ pub mod builtin;
 pub mod cleaner;
 pub mod duplicates;
 pub mod mft;
+pub mod migrate;
 pub mod plan;
 pub mod procs;
 pub mod registry;

@@ -6,6 +6,7 @@
   import TreeNode from '../components/TreeNode.svelte';
   import Treemap from '../components/Treemap.svelte';
   import CandidatePanel from '../components/CandidatePanel.svelte';
+  import TopFiles from '../components/TopFiles.svelte';
   import Icon from '../components/Icon.svelte';
   import { iconKind } from '../lib/fileicon';
   import { clearCands } from '../lib/candidates.svelte';
@@ -112,14 +113,7 @@
 
     <section class="card">
       <h2>{t('scan.topFiles')}</h2>
-      <ol class="top">
-        {#each summary.top_files as f}
-          <li>
-            <span class="size num">{formatSize(f.size)}</span>
-            <span class="fl"><Icon kind={iconKind(f.path.split(/[\\/]/).pop() ?? '', false)} size={16} /><span class="path mono ellipsis" title={f.path}>{f.path}</span></span>
-          </li>
-        {/each}
-      </ol>
+      <TopFiles files={summary.top_files} root={summary.root} />
     </section>
   </div>
 {:else if !error}
@@ -142,12 +136,8 @@
   .seg button:first-child { border-radius: 8px 0 0 8px; }
   .seg button:last-child { border-radius: 0 8px 8px 0; margin-left: -1px; }
   .small { font-size: 12.5px; margin: 6px 0; }
-  .cols { display: grid; grid-template-columns: minmax(0, 1.9fr) minmax(0, 1fr); gap: 16px; margin-top: 12px; align-items: start; }
+  .cols { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr); gap: 16px; margin-top: 12px; align-items: start; }
   @media (max-width: 1080px) { .cols { grid-template-columns: 1fr; } }
   .tree { list-style: none; margin: 0; padding: 0; overflow-x: auto; }
   .cols > .card { min-width: 0; }
-  .top { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
-  .top li { display: grid; grid-template-columns: 78px 1fr; gap: 8px; align-items: baseline; }
-  .size { text-align: right; font-weight: 600; }
-  .fl { display: flex; align-items: center; gap: 6px; min-width: 0; }
 </style>

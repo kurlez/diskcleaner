@@ -1,5 +1,5 @@
 // 仅用于在普通浏览器里预览/截图界面，不会进入发布版。
-import type { Api, AppInfo, Child, Leftover, CleanProgress, DupGroup, DupProgress, DupSummary, PlanSummary, Report, Rule, ScanProgress, Settings } from './types';
+import type { Api, AppInfo, Blockers, Migration, Child, Leftover, CleanProgress, DupGroup, DupProgress, DupSummary, PlanSummary, Report, Rule, ScanProgress, Settings } from './types';
 
 const GB = 1024 ** 3;
 const MB = 1024 ** 2;
@@ -39,6 +39,20 @@ const apps: AppInfo[] = [
   { id: 5, name: 'Contoso.Notes', version: '1.0.0.0', publisher: 'CN=Contoso', install_date: null, size_kb: null, install_location: null, kind: 'store', can_uninstall: true, uninstall_command: null },
 ];
 let uninstalledFoo = false;
+let mockBlockers: Blockers = {
+  blockers: [
+    { pid: 4120, name: 'Docker Desktop.exe', exe: 'C:\\Users\\alice\\AppData\\Local\\Docker\\Docker Desktop.exe', kinds: ['image', 'open_file'], service: null, protection: null,
+      related: [{ pid: 4188, name: 'com.docker.backend.exe', reason: 'descendant' }, { pid: 4230, name: 'vpnkit.exe', reason: 'same_folder' }] },
+    { pid: 5560, name: 'wsl.exe', exe: 'C:\\Windows\\System32\\wsl.exe', kinds: ['current_dir'], service: null, protection: null, related: [] },
+    { pid: 2288, name: 'explorer.exe', exe: 'C:\\Windows\\explorer.exe', kinds: ['open_file'], service: null, protection: 'explorer', related: [] },
+  ],
+  rm_error: null, files_checked: 18_204, truncated: false,
+};
+let migrations: Migration[] = [
+  { id: '20241020-101500-000', source: 'C:\\Users\\alice\\AppData\\Local\\Steam', target: 'D:\\DiskClean-Migrated\\Users\\alice\\AppData\\Local\\Steam', size: 42 * GB, files: 51_220, created: 1_729_419_300, status: 'done', note: null, old_path: null },
+];
+let cancelMig = false;
+const migListeners = new Set<(p: import('./types').MigProgress) => void>();
 const leftoverSample: Leftover[] = [
   { id: 0, kind: 'folder', path: 'C:\\Program Files\\Foo Editor', value_name: null, confidence: 'high', reason: 'install_location', size: 148 * MB, files: 1_204, default_selected: true },
   { id: 1, kind: 'folder', path: 'C:\\Users\\alice\\AppData\\Roaming\\FooEditor', value_name: null, confidence: 'high', reason: 'name_match', size: 12 * MB, files: 88, default_selected: true },
@@ -96,6 +110,8 @@ export const mockApi: Api = {
         { path: 'C:\\pagefile.sys', size: 6 * GB },
         { path: 'C:\\Users\\alice\\AppData\\Local\\Docker\\wsl\\data\\ext4.vhdx', size: 5 * GB + 300 * MB },
         { path: 'C:\\Windows\\SoftwareDistribution\\Download\\a1b2.cab', size: 1 * GB + 80 * MB },
+        { path: 'D:\\SynologyDrive\\_IQLIBRARY\\Projects\\2024\\Quarterly Reports\\Raw Footage\\Camera A\\Day 03\\Takes\\INTERVIEW_MAIN_CAMERA_4K_PRORES_422_HQ_FINAL_v7.mov', size: 2.4 * GB },
+        { path: 'D:\\EGLIBRARY\\WLIU-LIBRARY.library\\images\\LK3X9A2B7QD.info\\VID_20240815_093012_original_recording.mp4', size: 891 * MB },
       ],
     };
   },
@@ -194,6 +210,53 @@ export const mockApi: Api = {
     if (id === 'shadow_copy') throw { code: 'sys_failed', detail: 'command_failed: vssadmin.exe exited with 1: No items found that satisfy the query.' };
     return { id, free_before: 38 * GB, free_after: 44 * GB, output: '' };
   },
+  async migPreflight(source, target) {
+    await sleep(500);
+    const issues: import('./types').MigIssue[] = [];
+    if (/windows/i.test(source)) issues.push({ severity: 'error', code: 'source_protected', detail: 'protected location' });
+    if (source[0]?.toUpperCase() === target[0]?.toUpperCase()) issues.push({ severity: 'error', code: 'same_volume', detail: null });
+    if (/Program Files/i.test(source)) issues.push({ severity: 'warning', code: 'program_dir', detail: null });
+    return {
+      size: 23 * GB, files: 18_204, issues, can_proceed: !issues.some((i) => i.severity === 'error'),
+      source_volume: 'C:\\', target_volume: 'D:\\', target_free: 612 * GB,
+    };
+  },
+  async migBlockers() {
+    await sleep(700);
+    return mockBlockers;
+  },
+  async migStop(pids, includeRelated, force) {
+    await sleep(900);
+    const results = pids.map((pid) => {
+      const b = mockBlockers.blockers.find((x) => x.pid === pid);
+      return { pid, name: b?.name ?? '', status: b?.protection ? 'refused' : force ? 'forced' : 'exited', detail: null };
+    });
+    if (includeRelated) mockBlockers.blockers.filter((b) => pids.includes(b.pid)).forEach((b) => b.related.forEach((r) => results.push({ pid: r.pid, name: r.name, status: 'exited', detail: null })));
+    mockBlockers = { ...mockBlockers, blockers: mockBlockers.blockers.filter((b) => !pids.includes(b.pid) || b.protection) };
+    return results;
+  },
+  async migStart(source, target) {
+    cancelMig = false;
+    const stages = [['copying', 8], ['verifying', 1], ['switching', 1], ['cleaning', 1]] as const;
+    for (const [stage, n] of stages) {
+      for (let i = 1; i <= n && !cancelMig; i++) {
+        await sleep(stage === 'copying' ? 250 : 400);
+        migListeners.forEach((cb) => cb({ stage, done: Math.round((i / n) * 23 * GB), total: 23 * GB }));
+      }
+    }
+    if (cancelMig) throw { code: 'cancelled', detail: null };
+    const rec: Migration = { id: `m-${Date.now()}`, source, target, size: 23 * GB, files: 18_204, created: Math.floor(Date.now() / 1000), status: 'done', note: null, old_path: null };
+    migrations = [rec, ...migrations];
+    return rec;
+  },
+  async migCancel() { cancelMig = true; },
+  async migList() { return migrations; },
+  async migRestore(id) {
+    await sleep(1200);
+    migrations = migrations.map((m) => (m.id === id ? { ...m, status: 'restored' as const } : m));
+    return migrations.find((m) => m.id === id)!;
+  },
+  async onMigProgress(cb) { migListeners.add(cb); return () => migListeners.delete(cb); },
   async candResolve(items) {
     await sleep(120);
     return items.map((parts) => ({

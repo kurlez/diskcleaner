@@ -16,13 +16,27 @@ const LEFTOVER_REASONS = [
   'install_location', 'name_match', 'publisher_emptied', 'uninstall_entry', 'app_path',
   'auto_run', 'stale_service', 'com_registration', 'shortcut',
 ];
+const MIG_ISSUES = [
+  'invalid_path', 'source_missing', 'source_not_dir', 'source_is_link', 'already_migrated',
+  'source_protected', 'target_protected', 'target_inside_source', 'source_inside_target',
+  'migration_in_progress', 'same_volume', 'target_remote', 'target_removable',
+  'source_fs_unsupported', 'volume_unknown', 'target_exists_nonempty', 'contains_links',
+  'contains_cloud', 'not_enough_space', 'large', 'program_dir',
+];
+const MIG_KINDS = ['image', 'current_dir', 'open_file', 'service'];
+const MIG_PROTECT = ['this_app', 'critical', 'explorer', 'service_host'];
+const MIG_STOP = ['exited', 'forced', 'service_stopped', 'already_gone', 'still_running', 'refused', 'failed'];
+const MIG_STAGES = ['copying', 'verifying', 'switching', 'cleaning'];
+const MIG_STATUS = ['copying', 'switching', 'done', 'restoring', 'failed', 'restored'];
 const SYS_ACTIONS = ['recycle_bin', 'hibernation', 'component_store', 'windows_old', 'shadow_copy'];
 const ERROR_CODES = [
   'unsupported_platform', 'invalid_path', 'scan_failed', 'unknown_rule', 'no_plan', 'no_scan',
   'journal_failed', 'invalid_exclusion', 'settings_failed', 'policy', 'internal', 'unknown',
   'must_keep_one', 'keeper_changed', 'changed_since_scan', 'invalid_selection', 'nothing_selected',
   'unknown_action', 'sys_failed', 'unknown_app', 'no_uninstaller', 'invalid_command',
-  'uninstall_failed', 'backup_failed',
+  'uninstall_failed', 'backup_failed', 'mig_preflight', 'mig_copy_failed', 'mig_verify_failed',
+  'mig_in_use', 'mig_link_failed', 'mig_manifest', 'mig_not_restorable', 'unknown_migration',
+  'no_blockers', 'cancelled',
 ];
 
 describe('locales', () => {
@@ -46,6 +60,12 @@ describe('locales', () => {
         expect(d[`rule.${id}.desc`], id).toBeTruthy();
       }
       for (const r of SKIP_REASONS) expect(d[`skip.${r}`], r).toBeTruthy();
+      for (const k of MIG_ISSUES) expect(d[`mig.issue.${k}`], k).toBeTruthy();
+      for (const k of MIG_KINDS) expect(d[`mig.kind.${k}`], k).toBeTruthy();
+      for (const k of MIG_PROTECT) expect(d[`mig.protect.${k}`], k).toBeTruthy();
+      for (const k of MIG_STOP) expect(d[`mig.stopStatus.${k}`], k).toBeTruthy();
+      for (const k of MIG_STAGES) expect(d[`mig.stage.${k}`], k).toBeTruthy();
+      for (const k of MIG_STATUS) expect(d[`mig.status.${k}`], k).toBeTruthy();
       for (const r of LEFTOVER_REASONS) expect(d[`un.reason.${r}`], r).toBeTruthy();
       for (const a of SYS_ACTIONS) for (const k of ['name', 'desc', 'warn']) expect(d[`sys.${a}.${k}`], a).toBeTruthy();
       for (const c of FALLBACK_CODES) expect(d[`scan.fallback.${c}`], c).toBeTruthy();

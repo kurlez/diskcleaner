@@ -12,7 +12,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use diskclean_core::cleaner::{execute_with, ExecOptions, Report, Status};
 use diskclean_core::duplicates::{self, DupGroup, DupOptions, DupOutcome, DupPhase};
+use diskclean_core::migrate::{
+    self, Copier, Deps, DirMover, LinkMaker, ManifestStore, MigrateError, MigrationRecord,
+    Preflight, PreflightOptions, Recovery, Severity, Stage, Volumes,
+};
 use diskclean_core::plan::{build_plan, Candidate, Plan, PlanSkipReason};
+use diskclean_core::procs::{
+    self, Blocker, BlockerKind, BlockerReport, OpenFileFinder, ProcessSource, Protection,
+    RelatedReason, StopStatus, StopTiming,
+};
 use diskclean_core::registry::{Hive, NoRegistry, Registry};
 use diskclean_core::rules::{Disposal, Env, Risk, Rule};
 use diskclean_core::safety::SafetyPolicy;
@@ -329,6 +337,111 @@ pub struct CandResolved {
     pub is_link: bool,
 }
 
+// ---------- 目录迁移 DTO ----------
+
+#[derive(Debug, Serialize)]
+pub struct IssueDto {
+    /// `error` 会阻止迁移；`warning` 只是提示。
+    pub severity: &'static str,
+    pub code: &'static str,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PreflightDto {
+    pub size: u64,
+    pub files: u64,
+    pub issues: Vec<IssueDto>,
+    pub can_proceed: bool,
+    pub source_volume: Option<String>,
+    pub target_volume: Option<String>,
+    pub target_free: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RelatedDto {
+    pub pid: u32,
+    pub name: String,
+    /// `descendant` / `same_folder`
+    pub reason: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BlockerDto {
+    pub pid: u32,
+    pub name: String,
+    pub exe: Option<String>,
+    /// `image` / `current_dir` / `open_file` / `service`
+    pub kinds: Vec<&'static str>,
+    pub service: Option<String>,
+    /// `this_app` / `critical` / `explorer` / `service_host`；有值时不允许停止。
+    pub protection: Option<&'static str>,
+    pub related: Vec<RelatedDto>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BlockersDto {
+    pub blockers: Vec<BlockerDto>,
+    pub rm_error: Option<String>,
+    pub files_checked: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StopResultDto {
+    pub pid: u32,
+    pub name: String,
+    /// `exited` / `forced` / `service_stopped` / `already_gone` / `still_running` / `refused` / `failed`
+    pub status: &'static str,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MigrationDto {
+    pub id: String,
+    pub source: String,
+    pub target: String,
+    pub size: u64,
+    pub files: u64,
+    pub created: u64,
+    /// `copying` / `switching` / `done` / `restoring` / `failed` / `restored`
+    pub status: &'static str,
+    pub note: Option<String>,
+    pub old_path: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone, Copy)]
+pub struct MigProgressDto {
+    /// `copying` / `verifying` / `switching` / `cleaning`
+    pub stage: &'static str,
+    pub done: u64,
+    pub total: u64,
+}
+
+/// 目录迁移所需的外部能力（生产环境与测试各自提供）。
+pub struct MigrateParts {
+    pub procs: Arc<dyn ProcessSource>,
+    pub rm: Arc<dyn OpenFileFinder>,
+    pub volumes: Arc<dyn Volumes>,
+    pub copier: Arc<dyn Copier>,
+    pub mover: Arc<dyn DirMover>,
+    pub links: Arc<dyn LinkMaker>,
+    pub policy_factory: Arc<PolicyFactory>,
+    pub manifest_path: PathBuf,
+    pub program_dirs: Vec<PathBuf>,
+    pub system_dirs: Vec<PathBuf>,
+    pub self_pid: u32,
+    /// 停止进程时的等待时间（生产环境用默认值，测试用极短值）。
+    pub stop_timing: StopTiming,
+}
+
+struct MigState {
+    parts: MigrateParts,
+    store: ManifestStore,
+    blockers: Mutex<Option<(PathBuf, BlockerReport)>>,
+    cancel: AtomicBool,
+}
+
 // ---------- Service ----------
 
 pub type PolicyFactory = dyn Fn(&[String]) -> Result<SafetyPolicy> + Send + Sync;
@@ -366,6 +479,7 @@ pub struct Service {
     fs_roots: FsRoots,
     apps: Mutex<Vec<InstalledApp>>,
     leftovers: Mutex<Option<LeftoverState>>,
+    mig: Option<MigState>,
 }
 
 struct LeftoverState {
@@ -401,7 +515,20 @@ impl Service {
             fs_roots: FsRoots::default(),
             apps: Mutex::new(Vec::new()),
             leftovers: Mutex::new(None),
+            mig: None,
         }
+    }
+
+    /// 注入目录迁移所需的外部能力，并读取迁移清单。
+    pub fn with_migrate(mut self, parts: MigrateParts) -> Self {
+        let store = ManifestStore::open(parts.manifest_path.clone());
+        self.mig = Some(MigState {
+            parts,
+            store,
+            blockers: Mutex::new(None),
+            cancel: AtomicBool::new(false),
+        });
+        self
     }
 
     /// 注入注册表、残留文件的安全策略与扫描位置（生产环境与测试各自提供）。
@@ -1049,6 +1176,203 @@ impl Service {
         Ok(dto)
     }
 
+    // ----- 目录迁移 -----
+
+    fn mig(&self) -> Result<&MigState> {
+        self.mig
+            .as_ref()
+            .ok_or(ApiError::new("unsupported_platform"))
+    }
+
+    fn mig_deps<'a>(&'a self, m: &'a MigState) -> Deps<'a> {
+        Deps {
+            copier: m.parts.copier.as_ref(),
+            mover: m.parts.mover.as_ref(),
+            links: m.parts.links.as_ref(),
+            volumes: m.parts.volumes.as_ref(),
+            store: &m.store,
+        }
+    }
+
+    /// 迁移前检查。只读。
+    pub fn mig_preflight(
+        &self,
+        source: &str,
+        target: &str,
+        exclusions: &[String],
+    ) -> Result<PreflightDto> {
+        let m = self.mig()?;
+        let policy = (m.parts.policy_factory)(exclusions)?;
+        let opts = PreflightOptions {
+            program_dirs: m.parts.program_dirs.clone(),
+        };
+        let p = migrate::preflight(
+            Path::new(source),
+            Path::new(target),
+            m.parts.volumes.as_ref(),
+            &policy,
+            &m.store.list(),
+            &opts,
+        );
+        Ok(preflight_dto(&p))
+    }
+
+    /// 找出占用该目录的进程，并保存结果供随后的"停止"使用。
+    pub fn mig_blockers(&self, dir: &str) -> Result<BlockersDto> {
+        let m = self.mig()?;
+        let path = PathBuf::from(dir);
+        if !path.is_dir() {
+            return Err(ApiError::with("invalid_path", dir));
+        }
+        let (files, truncated) = procs::collect_files(&path);
+        let report = procs::find_blockers(
+            &path,
+            m.parts.procs.as_ref(),
+            m.parts.rm.as_ref(),
+            &files,
+            truncated,
+            m.parts.self_pid,
+            &m.parts.system_dirs,
+        );
+        let dto = blockers_dto(&report);
+        *m.blockers.lock().unwrap() = Some((path, report));
+        Ok(dto)
+    }
+
+    /// 停止用户勾选的占用进程。只接受上一次 `mig_blockers` 列出的进程；受保护的一律拒绝。
+    pub fn mig_stop(
+        &self,
+        pids: &[u32],
+        include_related: bool,
+        force: bool,
+    ) -> Result<Vec<StopResultDto>> {
+        let m = self.mig()?;
+        let guard = m.blockers.lock().unwrap();
+        let (_, report) = guard.as_ref().ok_or(ApiError::new("no_blockers"))?;
+        let plan = procs::plan_stop(
+            report,
+            pids,
+            include_related,
+            m.parts.procs.as_ref(),
+            m.parts.self_pid,
+        );
+        let results = procs::execute_stop(
+            &plan,
+            force,
+            m.parts.procs.as_ref(),
+            self.runner.as_ref(),
+            m.parts.stop_timing,
+        );
+        Ok(results
+            .into_iter()
+            .map(|r| {
+                let (status, detail) = match r.status {
+                    StopStatus::Exited => ("exited", None),
+                    StopStatus::Forced => ("forced", None),
+                    StopStatus::ServiceStopped => ("service_stopped", None),
+                    StopStatus::AlreadyGone => ("already_gone", None),
+                    StopStatus::StillRunning => ("still_running", None),
+                    StopStatus::Refused(d) => ("refused", Some(d)),
+                    StopStatus::Failed(d) => ("failed", Some(d)),
+                };
+                StopResultDto {
+                    pid: r.pid,
+                    name: r.name,
+                    status,
+                    detail,
+                }
+            })
+            .collect())
+    }
+
+    pub fn mig_cancel(&self) {
+        if let Some(m) = &self.mig {
+            m.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn mig_list(&self) -> Result<Vec<MigrationDto>> {
+        let m = self.mig()?;
+        let mut v: Vec<MigrationDto> = m.store.list().iter().map(migration_dto).collect();
+        v.sort_by_key(|r| std::cmp::Reverse(r.created));
+        Ok(v)
+    }
+
+    /// 启动时修复上次中断留下的中间状态记录。返回需要人工查看的记录数。
+    pub fn mig_recover(&self) -> usize {
+        let Some(m) = &self.mig else { return 0 };
+        let deps = self.mig_deps(m);
+        m.store
+            .list()
+            .iter()
+            .filter(|r| matches!(migrate::recover(r, &deps), Recovery::NeedsAttention(_)))
+            .count()
+    }
+
+    pub fn mig_start(
+        &self,
+        source: &str,
+        target: &str,
+        exclusions: &[String],
+        journal_path: &Path,
+        on_progress: &mut dyn FnMut(MigProgressDto),
+    ) -> Result<MigrationDto> {
+        let m = self.mig()?;
+        let policy = (m.parts.policy_factory)(exclusions)?;
+        m.cancel.store(false, Ordering::Relaxed);
+        let opts = PreflightOptions {
+            program_dirs: m.parts.program_dirs.clone(),
+        };
+        let mut journal = open_journal(journal_path)?;
+        let result = migrate::migrate(
+            Path::new(source),
+            Path::new(target),
+            &self.mig_deps(m),
+            &policy,
+            &opts,
+            &m.cancel,
+            &mut |p| {
+                on_progress(MigProgressDto {
+                    stage: stage_name(p.stage),
+                    done: p.done,
+                    total: p.total,
+                })
+            },
+        );
+        match result {
+            Ok(rec) => {
+                migrate::journal_line(&mut journal, &rec, "done");
+                Ok(migration_dto(&rec))
+            }
+            Err(e) => Err(migrate_error(e)),
+        }
+    }
+
+    pub fn mig_restore(
+        &self,
+        id: &str,
+        journal_path: &Path,
+        on_progress: &mut dyn FnMut(MigProgressDto),
+    ) -> Result<MigrationDto> {
+        let m = self.mig()?;
+        let rec = m
+            .store
+            .get(id)
+            .ok_or_else(|| ApiError::with("unknown_migration", id))?;
+        m.cancel.store(false, Ordering::Relaxed);
+        let mut journal = open_journal(journal_path)?;
+        let out = migrate::restore(&rec, &self.mig_deps(m), &m.cancel, &mut |p| {
+            on_progress(MigProgressDto {
+                stage: stage_name(p.stage),
+                done: p.done,
+                total: p.total,
+            })
+        })
+        .map_err(migrate_error)?;
+        migrate::journal_line(&mut journal, &out, "restored");
+        Ok(migration_dto(&out))
+    }
+
     // ----- 系统动作 -----
 
     pub fn sys_list(&self) -> Vec<SysActionDto> {
@@ -1092,6 +1416,125 @@ impl Service {
                 format!("{}: {}", e.code, e.detail),
             )),
         }
+    }
+}
+
+fn stage_name(s: Stage) -> &'static str {
+    match s {
+        Stage::Copying => "copying",
+        Stage::Verifying => "verifying",
+        Stage::Switching => "switching",
+        Stage::Cleaning => "cleaning",
+    }
+}
+
+fn preflight_dto(p: &Preflight) -> PreflightDto {
+    PreflightDto {
+        size: p.size,
+        files: p.files,
+        can_proceed: p.can_proceed(),
+        issues: p
+            .issues
+            .iter()
+            .map(|i| IssueDto {
+                severity: if i.severity == Severity::Error {
+                    "error"
+                } else {
+                    "warning"
+                },
+                code: i.code,
+                detail: i.detail.clone(),
+            })
+            .collect(),
+        source_volume: p.source_volume.clone(),
+        target_volume: p.target_volume.clone(),
+        target_free: p.target_free,
+    }
+}
+
+fn blockers_dto(r: &BlockerReport) -> BlockersDto {
+    let blocker = |b: &Blocker| BlockerDto {
+        pid: b.pid,
+        name: b.name.clone(),
+        exe: b.exe.clone(),
+        kinds: b
+            .kinds
+            .iter()
+            .map(|k| match k {
+                BlockerKind::Image => "image",
+                BlockerKind::CurrentDir => "current_dir",
+                BlockerKind::OpenFile => "open_file",
+                BlockerKind::Service => "service",
+            })
+            .collect(),
+        service: b.service.clone(),
+        protection: b.protection.map(|p| match p {
+            Protection::ThisApp => "this_app",
+            Protection::Critical => "critical",
+            Protection::Explorer => "explorer",
+            Protection::ServiceHost => "service_host",
+        }),
+        related: b
+            .related
+            .iter()
+            .map(|x| RelatedDto {
+                pid: x.pid,
+                name: x.name.clone(),
+                reason: match x.reason {
+                    RelatedReason::Descendant => "descendant",
+                    RelatedReason::SameFolder => "same_folder",
+                },
+            })
+            .collect(),
+    };
+    BlockersDto {
+        blockers: r.blockers.iter().map(blocker).collect(),
+        rm_error: r.rm_error.clone(),
+        files_checked: r.files_checked,
+        truncated: r.truncated,
+    }
+}
+
+fn migration_dto(r: &MigrationRecord) -> MigrationDto {
+    use migrate::Status as S;
+    MigrationDto {
+        id: r.id.clone(),
+        source: display_path(Path::new(&r.source)),
+        target: display_path(Path::new(&r.target)),
+        size: r.size,
+        files: r.files,
+        created: r.created,
+        status: match r.status {
+            S::Copying => "copying",
+            S::Switching => "switching",
+            S::Done => "done",
+            S::Restoring => "restoring",
+            S::Failed => "failed",
+            S::Restored => "restored",
+        },
+        note: r.note.clone(),
+        old_path: r.old_path.as_deref().map(|p| display_path(Path::new(p))),
+    }
+}
+
+fn migrate_error(e: MigrateError) -> ApiError {
+    match e {
+        MigrateError::Preflight(issues) => ApiError::with(
+            "mig_preflight",
+            issues
+                .iter()
+                .filter(|i| i.severity == Severity::Error)
+                .map(|i| i.code)
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        MigrateError::Cancelled => ApiError::new("cancelled"),
+        MigrateError::CopyFailed(m) => ApiError::with("mig_copy_failed", m),
+        MigrateError::VerifyFailed(m) => ApiError::with("mig_verify_failed", m),
+        MigrateError::InUse(m) => ApiError::with("mig_in_use", m),
+        MigrateError::LinkFailed(m) => ApiError::with("mig_link_failed", m),
+        MigrateError::Manifest(m) => ApiError::with("mig_manifest", m),
+        MigrateError::NotRestorable(m) => ApiError::with("mig_not_restorable", m),
     }
 }
 
@@ -2591,5 +3034,427 @@ mod tests {
             "invalid_path"
         );
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    // ---------- 目录迁移 ----------
+
+    use diskclean_core::migrate::{CopyStats, StdCopier, StdMover, VolumeInfo};
+    use diskclean_core::procs::{ProcInfo, RmKind, RmProc};
+
+    #[derive(Clone, Default)]
+    struct SharedProcs(Arc<Mutex<Vec<ProcInfo>>>);
+    impl ProcessSource for SharedProcs {
+        fn list(&self) -> Vec<ProcInfo> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    struct FakeRmFinder(Vec<RmProc>);
+    impl OpenFileFinder for FakeRmFinder {
+        fn processes_using(&self, _: &[PathBuf]) -> std::io::Result<Vec<RmProc>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// 模拟 taskkill：礼貌请求让 `graceful` 里的进程退出，/F 让所有进程退出。
+    struct TaskKill {
+        procs: SharedProcs,
+        graceful: Vec<u32>,
+        calls: Mutex<Vec<String>>,
+    }
+    impl CommandRunner for TaskKill {
+        fn run(&self, program: &str, args: &[&str]) -> std::io::Result<CmdOutput> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{program} {}", args.join(" ")));
+            if program == "taskkill.exe" {
+                let pid: u32 = args[1].parse().unwrap();
+                if args.contains(&"/F") || self.graceful.contains(&pid) {
+                    self.procs.0.lock().unwrap().retain(|p| p.pid != pid);
+                }
+            }
+            Ok(CmdOutput::default())
+        }
+    }
+
+    struct TwoVolumes {
+        c: PathBuf,
+        d: PathBuf,
+    }
+    impl Volumes for TwoVolumes {
+        fn volume_of(&self, path: &Path) -> Option<VolumeInfo> {
+            let mk = |m: &Path| VolumeInfo {
+                mount: m.to_path_buf(),
+                fs: "NTFS".into(),
+                free: 1 << 40,
+                total: 1 << 41,
+                removable: false,
+                remote: false,
+            };
+            if path.starts_with(&self.c) {
+                Some(mk(&self.c))
+            } else if path.starts_with(&self.d) {
+                Some(mk(&self.d))
+            } else {
+                None
+            }
+        }
+    }
+
+    struct SymLinks;
+    impl LinkMaker for SymLinks {
+        fn make_junction(&self, link: &Path, target: &Path) -> std::io::Result<()> {
+            #[cfg(unix)]
+            return std::os::unix::fs::symlink(target, link);
+            #[cfg(not(unix))]
+            {
+                let _ = (link, target);
+                Err(std::io::Error::other("unsupported"))
+            }
+        }
+        fn remove_link(&self, link: &Path) -> std::io::Result<()> {
+            migrate::remove_link(link)
+        }
+        fn link_target(&self, link: &Path) -> Option<PathBuf> {
+            fs::read_link(link).ok()
+        }
+    }
+
+    struct LockedMover;
+    impl DirMover for LockedMover {
+        fn rename_dir(&self, _: &Path, _: &Path) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Access is denied. (os error 5)",
+            ))
+        }
+    }
+
+    fn migration_service(
+        d: &Path,
+        procs: SharedProcs,
+        rm: Vec<RmProc>,
+        runner: Arc<dyn CommandRunner>,
+        mover: Arc<dyn DirMover>,
+    ) -> Service {
+        fs::create_dir_all(d.join("C")).unwrap();
+        fs::create_dir_all(d.join("D")).unwrap();
+        let base = d.to_string_lossy().into_owned();
+        let factory: Arc<PolicyFactory> = Arc::new(move |excl: &[String]| {
+            let mut p = SafetyPolicy::empty(PathStyle::Posix);
+            p.protect(&format!("{base}/C/Windows"))
+                .map_err(|e| ApiError::with("policy", e))?;
+            for x in excl {
+                p.exclude(x)
+                    .map_err(|e| ApiError::with("invalid_exclusion", e))?;
+            }
+            Ok(p)
+        });
+        service(d)
+            .with_system(runner, posix_factory(d, None))
+            .with_migrate(MigrateParts {
+                procs: Arc::new(procs),
+                rm: Arc::new(FakeRmFinder(rm)),
+                volumes: Arc::new(TwoVolumes {
+                    c: d.join("C"),
+                    d: d.join("D"),
+                }),
+                copier: Arc::new(StdCopier),
+                mover,
+                links: Arc::new(SymLinks),
+                policy_factory: factory,
+                manifest_path: d.join("meta/migrations.json"),
+                program_dirs: vec![],
+                system_dirs: vec![PathBuf::from("/windows")],
+                self_pid: 999,
+                stop_timing: StopTiming {
+                    graceful_wait: std::time::Duration::from_millis(10),
+                    force_wait: std::time::Duration::from_millis(10),
+                    poll: std::time::Duration::from_millis(1),
+                },
+            })
+    }
+
+    fn proc_in(pid: u32, parent: Option<u32>, name: &str, exe: &str) -> ProcInfo {
+        ProcInfo {
+            pid,
+            parent,
+            name: name.into(),
+            exe: Some(PathBuf::from(exe)),
+            cwd: None,
+            start_time: 1000 + u64::from(pid),
+        }
+    }
+
+    fn make_app_dir(d: &Path) {
+        write(&d.join("C/App/main.bin"), 4000);
+        write(&d.join("C/App/data/a.dat"), 300);
+    }
+
+    #[test]
+    fn migration_needs_its_platform_parts() {
+        let d = sandbox();
+        let svc = service(&d);
+        assert_eq!(
+            svc.mig_preflight("/a", "/b", &[]).unwrap_err().code,
+            "unsupported_platform"
+        );
+        assert_eq!(svc.mig_list().unwrap_err().code, "unsupported_platform");
+        assert_eq!(svc.mig_recover(), 0);
+        svc.mig_cancel();
+    }
+
+    #[test]
+    fn preflight_dto_reports_size_issues_and_whether_it_can_proceed() {
+        let d = sandbox();
+        make_app_dir(&d);
+        let svc = migration_service(
+            &d,
+            SharedProcs::default(),
+            vec![],
+            FakeRunner::scripted(vec![]),
+            Arc::new(StdMover),
+        );
+        let ok = svc
+            .mig_preflight(
+                &d.join("C/App").to_string_lossy(),
+                &d.join("D/Migrated/App").to_string_lossy(),
+                &[],
+            )
+            .unwrap();
+        assert!(ok.can_proceed, "{:?}", ok.issues);
+        assert_eq!((ok.size, ok.files), (4300, 2));
+        let bad = svc
+            .mig_preflight(
+                &d.join("C/App").to_string_lossy(),
+                &d.join("C/Other").to_string_lossy(),
+                &[],
+            )
+            .unwrap();
+        assert!(!bad.can_proceed);
+        let issue = bad.issues.iter().find(|i| i.code == "same_volume").unwrap();
+        assert_eq!(issue.severity, "error");
+        // 用户排除项也适用于迁移源：被排除的目录不能迁移。
+        let excl = [d.join("C/App").to_string_lossy().into_owned()];
+        let blocked = svc
+            .mig_preflight(
+                &d.join("C/App").to_string_lossy(),
+                &d.join("D/x").to_string_lossy(),
+                &excl,
+            )
+            .unwrap();
+        assert!(!blocked.can_proceed);
+        assert!(blocked.issues.iter().any(|i| i.code == "source_protected"));
+    }
+
+    #[test]
+    fn blockers_are_listed_and_only_listed_unprotected_processes_can_be_stopped() {
+        let d = sandbox();
+        make_app_dir(&d);
+        let dir = d.join("C/App");
+        let procs = SharedProcs::default();
+        *procs.0.lock().unwrap() = vec![
+            proc_in(1, None, "launcher.exe", "/elsewhere/launcher.exe"),
+            proc_in(
+                10,
+                Some(1),
+                "app.exe",
+                &format!("{}/app.exe", dir.display()),
+            ),
+            proc_in(11, Some(10), "app-helper.exe", "/elsewhere/helper.exe"),
+            proc_in(40, Some(1), "explorer.exe", "/windows/explorer.exe"),
+        ];
+        let rm = vec![RmProc {
+            pid: 40,
+            name: "Explorer".into(),
+            service: None,
+            kind: RmKind::Explorer,
+        }];
+        let runner = Arc::new(TaskKill {
+            procs: procs.clone(),
+            graceful: vec![11],
+            calls: Mutex::default(),
+        });
+        let svc = migration_service(&d, procs.clone(), rm, runner.clone(), Arc::new(StdMover));
+
+        assert_eq!(
+            svc.mig_stop(&[10], true, false).unwrap_err().code,
+            "no_blockers",
+            "没检测过占用就不能停止任何进程"
+        );
+        let b = svc.mig_blockers(&dir.to_string_lossy()).unwrap();
+        let app = b.blockers.iter().find(|x| x.pid == 10).unwrap();
+        assert_eq!(app.kinds, ["image"]);
+        assert_eq!(
+            app.related
+                .iter()
+                .map(|r| (r.pid, r.reason))
+                .collect::<Vec<_>>(),
+            [(11, "descendant")]
+        );
+        let explorer = b.blockers.iter().find(|x| x.pid == 40).unwrap();
+        assert_eq!(explorer.protection, Some("explorer"));
+        assert!(b.rm_error.is_none() && b.files_checked == 2);
+
+        // 请求停止：app（连同相关进程）、资源管理器（受保护）、启动器（不在占用者清单里）。
+        let res = svc.mig_stop(&[10, 40, 1], true, true).unwrap();
+        let st = |pid| res.iter().find(|r| r.pid == pid).unwrap().status;
+        assert_eq!(st(11), "exited", "子进程先礼貌关闭");
+        assert_eq!(st(10), "forced");
+        assert_eq!(st(40), "refused");
+        assert_eq!(st(1), "refused");
+        let left: Vec<u32> = procs.0.lock().unwrap().iter().map(|p| p.pid).collect();
+        assert_eq!(left, [1, 40], "启动器和资源管理器必须还在");
+        let calls = runner.calls.lock().unwrap().clone();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains(" 40") || c.ends_with(" 1") || c.contains("/PID 1 ")),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn blockers_need_an_existing_directory() {
+        let d = sandbox();
+        let svc = migration_service(
+            &d,
+            SharedProcs::default(),
+            vec![],
+            FakeRunner::scripted(vec![]),
+            Arc::new(StdMover),
+        );
+        assert_eq!(
+            svc.mig_blockers("/no/such/dir").unwrap_err().code,
+            "invalid_path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migrate_then_restore_end_to_end_with_history() {
+        let d = sandbox();
+        make_app_dir(&d);
+        let svc = migration_service(
+            &d,
+            SharedProcs::default(),
+            vec![],
+            FakeRunner::scripted(vec![]),
+            Arc::new(StdMover),
+        );
+        let (src, dst) = (d.join("C/App"), d.join("D/Migrated/App"));
+        let journal = d.join("j.jsonl");
+        let mut stages = Vec::new();
+        let rec = svc
+            .mig_start(
+                &src.to_string_lossy(),
+                &dst.to_string_lossy(),
+                &[],
+                &journal,
+                &mut |p| {
+                    if stages.last() != Some(&p.stage) {
+                        stages.push(p.stage);
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(rec.status, "done");
+        assert_eq!(stages, ["copying", "verifying", "switching", "cleaning"]);
+        assert!(fs::symlink_metadata(&src).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(src.join("main.bin")).unwrap().len(), 4000);
+        assert!(dst.join("data/a.dat").exists());
+
+        let list = svc.mig_list().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!((list[0].status, list[0].files), ("done", 2));
+        assert!(fs::read_to_string(&journal)
+            .unwrap()
+            .contains("\"op\":\"migration\""));
+
+        // 再迁一次同一个目录：它现在是链接，预检拒绝。
+        let again = svc
+            .mig_start(
+                &src.to_string_lossy(),
+                &d.join("D/again").to_string_lossy(),
+                &[],
+                &journal,
+                &mut |_| {},
+            )
+            .unwrap_err();
+        assert_eq!(again.code, "mig_preflight");
+        assert!(again.detail.unwrap().contains("already_migrated"));
+
+        let back = svc.mig_restore(&rec.id, &journal, &mut |_| {}).unwrap();
+        assert_eq!(back.status, "restored");
+        assert!(!fs::symlink_metadata(&src).unwrap().file_type().is_symlink());
+        assert!(!dst.exists());
+        assert_eq!(
+            svc.mig_restore("nope", &journal, &mut |_| {})
+                .unwrap_err()
+                .code,
+            "unknown_migration"
+        );
+    }
+
+    #[test]
+    fn a_locked_directory_is_reported_as_in_use_and_nothing_changes() {
+        let d = sandbox();
+        make_app_dir(&d);
+        let svc = migration_service(
+            &d,
+            SharedProcs::default(),
+            vec![],
+            FakeRunner::scripted(vec![]),
+            Arc::new(LockedMover),
+        );
+        let err = svc
+            .mig_start(
+                &d.join("C/App").to_string_lossy(),
+                &d.join("D/App").to_string_lossy(),
+                &[],
+                &d.join("j"),
+                &mut |_| {},
+            )
+            .unwrap_err();
+        assert_eq!(err.code, "mig_in_use");
+        assert!(err.detail.unwrap().contains("Access is denied"));
+        assert!(d.join("C/App/main.bin").exists());
+        assert!(!d.join("D/App").exists());
+        assert_eq!(svc.mig_list().unwrap()[0].status, "failed");
+    }
+
+    #[test]
+    fn interrupted_migrations_are_repaired_on_startup() {
+        let d = sandbox();
+        make_app_dir(&d);
+        write(&d.join("D/App/partial.bin"), 5);
+        let rec = MigrationRecord {
+            id: "x-1".into(),
+            source: d.join("C/App").to_string_lossy().into(),
+            target: d.join("D/App").to_string_lossy().into(),
+            old_path: None,
+            size: 1,
+            files: 1,
+            created: 1,
+            status: migrate::Status::Copying,
+            note: None,
+            target_created: true,
+        };
+        ManifestStore::open(d.join("meta/migrations.json"))
+            .upsert(&rec)
+            .unwrap();
+        let svc = migration_service(
+            &d,
+            SharedProcs::default(),
+            vec![],
+            FakeRunner::scripted(vec![]),
+            Arc::new(StdMover),
+        );
+        assert_eq!(svc.mig_recover(), 0, "能自动回滚的不算需要人工处理");
+        assert!(!d.join("D/App").exists(), "不完整的目标被清掉");
+        assert!(d.join("C/App/main.bin").exists());
+        assert_eq!(svc.mig_list().unwrap()[0].status, "failed");
+        let _ = CopyStats::default();
     }
 }

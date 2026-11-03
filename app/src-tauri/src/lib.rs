@@ -1,19 +1,23 @@
 mod service;
 mod settings;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use diskclean_core::builtin::windows_rules;
+use diskclean_core::migrate::{self, LinkMaker, MklinkJunction};
+use diskclean_core::procs;
 use diskclean_core::registry::Registry;
 use diskclean_core::rules::Env;
 use diskclean_core::safety::{KnownDirs, SafetyPolicy};
+use diskclean_core::sysaction::CommandRunner;
 use diskclean_core::uninstall::{self, FsRoots};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use service::{
-    ApiError, AppDto, CandResolved, ChildrenDto, DriveDto, DupSelection, DupSummary, ExecRequest,
-    LeftoverReportDto, LeftoversDto, PlanSummary, ReportDto, RuleDto, ScanSummary, Service,
+    ApiError, AppDto, BlockersDto, CandResolved, ChildrenDto, DriveDto, DupSelection, DupSummary,
+    ExecRequest, LeftoverReportDto, LeftoversDto, MigProgressDto, MigrateParts, MigrationDto,
+    PlanSummary, PreflightDto, ReportDto, RuleDto, ScanSummary, Service, StopResultDto,
     SysActionDto, SysResultDto, UninstallRunDto,
 };
 use settings::Settings;
@@ -96,6 +100,72 @@ fn windows_leftover_policy(exclusions: &[String]) -> Result<SafetyPolicy, ApiErr
     let policy =
         uninstall::leftover_policy(&dirs, &roots).map_err(|e| ApiError::with("policy", e))?;
     with_exclusions(policy, exclusions)
+}
+
+/// 目录迁移的安全策略：系统目录和用户根目录本身禁止，应用数据等子目录允许。
+fn windows_migration_policy(exclusions: &[String]) -> Result<SafetyPolicy, ApiError> {
+    let dirs = KnownDirs::from_env().ok_or(ApiError::new("unsupported_platform"))?;
+    let policy = migrate::migration_policy(&dirs).map_err(|e| ApiError::with("policy", e))?;
+    with_exclusions(policy, exclusions)
+}
+
+/// 通过命令执行器创建 junction（`mklink /J`）。
+struct RunnerLinks(Arc<dyn CommandRunner>);
+
+impl LinkMaker for RunnerLinks {
+    fn make_junction(&self, link: &Path, target: &Path) -> std::io::Result<()> {
+        MklinkJunction(self.0.as_ref()).make_junction(link, target)
+    }
+    fn remove_link(&self, link: &Path) -> std::io::Result<()> {
+        migrate::remove_link(link)
+    }
+    fn link_target(&self, link: &Path) -> Option<PathBuf> {
+        std::fs::read_link(link).ok()
+    }
+}
+
+#[cfg(windows)]
+fn open_file_finder() -> Arc<dyn procs::OpenFileFinder> {
+    Arc::new(procs::RestartManager)
+}
+
+#[cfg(not(windows))]
+fn open_file_finder() -> Arc<dyn procs::OpenFileFinder> {
+    Arc::new(procs::NoOpenFileFinder)
+}
+
+/// Windows 用 robocopy（保留 ACL 与所有者）；其他平台用纯 Rust 复制。
+#[cfg(windows)]
+fn real_copier() -> Arc<dyn migrate::Copier> {
+    Arc::new(migrate::RobocopyCopier)
+}
+
+#[cfg(not(windows))]
+fn real_copier() -> Arc<dyn migrate::Copier> {
+    Arc::new(migrate::StdCopier)
+}
+
+fn migrate_parts(manifest_path: PathBuf, runner: Arc<dyn CommandRunner>) -> MigrateParts {
+    let env = Env::from_process();
+    let dirs = |keys: &[&str]| -> Vec<PathBuf> {
+        keys.iter()
+            .filter_map(|k| env.get(k).map(PathBuf::from))
+            .collect()
+    };
+    MigrateParts {
+        procs: Arc::new(procs::SysinfoProcesses),
+        rm: open_file_finder(),
+        volumes: Arc::new(migrate::SysVolumes),
+        copier: real_copier(),
+        mover: Arc::new(migrate::StdMover),
+        links: Arc::new(RunnerLinks(runner)),
+        policy_factory: Arc::new(windows_migration_policy),
+        manifest_path,
+        program_dirs: dirs(&["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"]),
+        system_dirs: dirs(&["SystemRoot"]),
+        self_pid: std::process::id(),
+        stop_timing: procs::StopTiming::default(),
+    }
 }
 
 #[cfg(windows)]
@@ -338,6 +408,84 @@ async fn cand_delete(
 }
 
 #[tauri::command]
+async fn mig_preflight(
+    state: State<'_, AppState>,
+    source: String,
+    target: String,
+) -> Result<PreflightDto, ApiError> {
+    let svc = state.svc.clone();
+    let exclusions = state.settings.lock().unwrap().exclusions.clone();
+    blocking(move || svc.mig_preflight(&source, &target, &exclusions)).await
+}
+
+#[tauri::command]
+async fn mig_blockers(state: State<'_, AppState>, dir: String) -> Result<BlockersDto, ApiError> {
+    let svc = state.svc.clone();
+    blocking(move || svc.mig_blockers(&dir)).await
+}
+
+#[tauri::command]
+async fn mig_stop(
+    state: State<'_, AppState>,
+    pids: Vec<u32>,
+    include_related: bool,
+    force: bool,
+) -> Result<Vec<StopResultDto>, ApiError> {
+    let svc = state.svc.clone();
+    blocking(move || svc.mig_stop(&pids, include_related, force)).await
+}
+
+#[tauri::command]
+async fn mig_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    source: String,
+    target: String,
+) -> Result<MigrationDto, ApiError> {
+    let svc = state.svc.clone();
+    let journal = state.journal_path.clone();
+    let exclusions = state.settings.lock().unwrap().exclusions.clone();
+    blocking(move || {
+        svc.mig_start(
+            &source,
+            &target,
+            &exclusions,
+            &journal,
+            &mut |p: MigProgressDto| {
+                let _ = app.emit("mig-progress", p);
+            },
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+fn mig_cancel(state: State<'_, AppState>) {
+    state.svc.mig_cancel();
+}
+
+#[tauri::command]
+fn mig_list(state: State<'_, AppState>) -> Result<Vec<MigrationDto>, ApiError> {
+    state.svc.mig_list()
+}
+
+#[tauri::command]
+async fn mig_restore(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<MigrationDto, ApiError> {
+    let svc = state.svc.clone();
+    let journal = state.journal_path.clone();
+    blocking(move || {
+        svc.mig_restore(&id, &journal, &mut |p: MigProgressDto| {
+            let _ = app.emit("mig-progress", p);
+        })
+    })
+    .await
+}
+
+#[tauri::command]
 fn settings_get(state: State<'_, AppState>) -> Settings {
     state.settings.lock().unwrap().clone()
 }
@@ -380,7 +528,13 @@ pub fn run() {
                 real_registry(),
                 Box::new(windows_leftover_policy),
                 FsRoots::from_env(&Env::from_process()),
-            );
+            )
+            .with_migrate(migrate_parts(
+                data_dir.join("migrations.json"),
+                Arc::new(diskclean_core::sysaction::SystemRunner),
+            ));
+            // 上次被中断的迁移：根据磁盘上的实际状态回滚或补记完成。
+            let _ = svc.mig_recover();
             app.manage(AppState {
                 svc: Arc::new(svc),
                 settings: Mutex::new(settings),
@@ -413,6 +567,13 @@ pub fn run() {
             app_delete_leftovers,
             cand_resolve,
             cand_delete,
+            mig_preflight,
+            mig_blockers,
+            mig_stop,
+            mig_start,
+            mig_cancel,
+            mig_list,
+            mig_restore,
             settings_get,
             settings_set_exclusions,
         ])

@@ -61,6 +61,25 @@ export interface CandResolved {
   path: string; is_dir: boolean; size: number; files: number; exists: boolean; is_link: boolean;
 }
 
+export interface MigIssue { severity: 'error' | 'warning'; code: string; detail: string | null }
+export interface MigPreflight {
+  size: number; files: number; issues: MigIssue[]; can_proceed: boolean;
+  source_volume: string | null; target_volume: string | null; target_free: number | null;
+}
+export interface Related { pid: number; name: string; reason: 'descendant' | 'same_folder' }
+export interface Blocker {
+  pid: number; name: string; exe: string | null; kinds: string[]; service: string | null;
+  protection: 'this_app' | 'critical' | 'explorer' | 'service_host' | null; related: Related[];
+}
+export interface Blockers { blockers: Blocker[]; rm_error: string | null; files_checked: number; truncated: boolean }
+export interface StopResult { pid: number; name: string; status: string; detail: string | null }
+export interface Migration {
+  id: string; source: string; target: string; size: number; files: number; created: number;
+  status: 'copying' | 'switching' | 'done' | 'restoring' | 'failed' | 'restored';
+  note: string | null; old_path: string | null;
+}
+export interface MigProgress { stage: 'copying' | 'verifying' | 'switching' | 'cleaning'; done: number; total: number }
+
 export interface ApiError { code: string; detail?: string | null }
 
 export interface Api {
@@ -82,6 +101,14 @@ export interface Api {
   dupDelete(selections: DupSelection[], recycle: boolean): Promise<Report>;
   sysList(): Promise<SysAction[]>;
   sysRun(id: string): Promise<SysResult>;
+  migPreflight(source: string, target: string): Promise<MigPreflight>;
+  migBlockers(dir: string): Promise<Blockers>;
+  migStop(pids: number[], includeRelated: boolean, force: boolean): Promise<StopResult[]>;
+  migStart(source: string, target: string): Promise<Migration>;
+  migCancel(): Promise<void>;
+  migList(): Promise<Migration[]>;
+  migRestore(id: string): Promise<Migration>;
+  onMigProgress(cb: (p: MigProgress) => void): Promise<() => void>;
   candResolve(items: string[][]): Promise<CandResolved[]>;
   candDelete(items: string[][], recycle: boolean): Promise<Report>;
   appsList(includeStore: boolean): Promise<AppInfo[]>;
