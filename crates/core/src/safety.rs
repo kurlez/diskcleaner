@@ -63,8 +63,43 @@ impl std::error::Error for Denied {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NormPath(Vec<String>);
 
+/// 路径语法。生产环境使用 `Windows`；`Posix` 仅用于在非 Windows 平台上
+/// 对真实文件系统做集成测试，规则（受保护名称、前缀判断等）完全一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathStyle {
+    Windows,
+    Posix,
+}
+
 impl NormPath {
-    fn parse(input: &str) -> Result<Self, Denied> {
+    fn parse(input: &str, style: PathStyle) -> Result<Self, Denied> {
+        match style {
+            PathStyle::Windows => Self::parse_windows(input),
+            PathStyle::Posix => Self::parse_posix(input),
+        }
+    }
+
+    fn parse_posix(input: &str) -> Result<Self, Denied> {
+        if !input.starts_with('/') {
+            return Err(Denied::NotAbsolute);
+        }
+        let mut parts = vec!["/".to_string()];
+        for raw in input.split('/') {
+            if raw.is_empty() || raw == "." {
+                continue;
+            }
+            if raw == ".." {
+                return Err(Denied::ContainsParentRef);
+            }
+            if raw.chars().any(|c| c.is_control()) {
+                return Err(Denied::UnsupportedPath);
+            }
+            parts.push(raw.to_string());
+        }
+        Ok(NormPath(parts))
+    }
+
+    fn parse_windows(input: &str) -> Result<Self, Denied> {
         let s = input.replace('/', "\\");
 
         // 仅接受 `\\?\X:\...` 扩展前缀；`\\?\UNC\`、`\\.\` 与普通 UNC 一律拒绝。
@@ -121,7 +156,11 @@ impl NormPath {
     }
 
     fn display(&self) -> String {
-        self.0.join("\\")
+        if self.0[0] == "/" {
+            format!("/{}", self.0[1..].join("/"))
+        } else {
+            self.0.join("\\")
+        }
     }
 }
 
@@ -129,6 +168,11 @@ impl NormPath {
 fn has_short_name_marker(name: &str) -> bool {
     let b = name.as_bytes();
     b.windows(2).any(|w| w[0] == b'~' && w[1].is_ascii_digit())
+}
+
+/// 名称是否属于"无论在哪都不能删"的受保护名称（不区分大小写）。
+pub fn is_protected_name(name: &str) -> bool {
+    PROTECTED_NAMES.contains(&name.to_lowercase().as_str())
 }
 
 /// `a` 是否为 `b` 的前缀（含相等）。
@@ -175,18 +219,20 @@ impl KnownDirs {
 /// 删除安全策略。
 #[derive(Debug, Clone)]
 pub struct SafetyPolicy {
+    style: PathStyle,
     protected: Vec<NormPath>,
     allow: Vec<NormPath>,
+    /// 用户排除项：优先级最高，即使位于允许根之内也拒绝（含其祖先）。
+    hard: Vec<NormPath>,
+    /// 精确允许的单个路径（用于 `MEMORY.DMP` 这类位于受保护目录下的单文件）。
+    allow_exact: Vec<NormPath>,
 }
 
 impl SafetyPolicy {
     /// 用默认保护名单构建策略。已知目录若无法解析则返回 `Err`，
     /// 避免在保护缺失的情况下悄悄继续。
     pub fn new(dirs: &KnownDirs) -> Result<Self, Denied> {
-        let mut p = SafetyPolicy {
-            protected: Vec::new(),
-            allow: Vec::new(),
-        };
+        let mut p = SafetyPolicy::empty(PathStyle::Windows);
         for d in [
             &dirs.system_root,
             &dirs.program_files,
@@ -196,7 +242,7 @@ impl SafetyPolicy {
         ] {
             p.protect(d)?;
         }
-        let drive = NormPath::parse(&dirs.system_root)?.0[0].clone();
+        let drive = NormPath::parse(&dirs.system_root, PathStyle::Windows)?.0[0].clone();
         for special in [
             "System Volume Information",
             "$Recycle.Bin",
@@ -215,22 +261,45 @@ impl SafetyPolicy {
         Ok(p)
     }
 
+    /// 不带任何默认保护的空策略（仅用于测试或自行配置）。
+    pub fn empty(style: PathStyle) -> Self {
+        SafetyPolicy {
+            style,
+            protected: Vec::new(),
+            hard: Vec::new(),
+            allow: Vec::new(),
+            allow_exact: Vec::new(),
+        }
+    }
+
+    /// 添加用户排除路径：任何规则、允许根都无法覆盖它。
+    pub fn exclude(&mut self, path: &str) -> Result<(), Denied> {
+        self.hard.push(NormPath::parse(path, self.style)?);
+        Ok(())
+    }
+
     /// 追加受保护路径（例如用户在设置里配置的排除目录）。
     pub fn protect(&mut self, path: &str) -> Result<(), Denied> {
-        self.protected.push(NormPath::parse(path)?);
+        self.protected.push(NormPath::parse(path, self.style)?);
+        Ok(())
+    }
+
+    /// 精确允许删除某一个路径本身（不含其父目录的其它内容）。
+    pub fn allow_exact(&mut self, path: &str) -> Result<(), Denied> {
+        self.allow_exact.push(NormPath::parse(path, self.style)?);
         Ok(())
     }
 
     /// 追加允许根：其**内部**的内容可删除（根本身不算）。
     /// 允许根比保护根更具体时生效，例如 `C:\Windows\Temp`。
     pub fn allow_root(&mut self, path: &str) -> Result<(), Denied> {
-        self.allow.push(NormPath::parse(path)?);
+        self.allow.push(NormPath::parse(path, self.style)?);
         Ok(())
     }
 
     /// 判断 `path` 是否允许被删除。
     pub fn check_delete(&self, path: &str) -> Result<(), Denied> {
-        let target = NormPath::parse(path)?;
+        let target = NormPath::parse(path, self.style)?;
 
         if target.0.len() == 1 {
             return Err(Denied::DriveRoot);
@@ -239,6 +308,16 @@ impl SafetyPolicy {
             if PROTECTED_NAMES.contains(&part.as_str()) {
                 return Err(Denied::ProtectedName(part.clone()));
             }
+        }
+
+        for h in &self.hard {
+            if is_prefix(&h.0, &target.0) || is_prefix(&target.0, &h.0) {
+                return Err(Denied::Protected(h.display()));
+            }
+        }
+
+        if self.allow_exact.contains(&target) {
+            return Ok(());
         }
 
         // 最具体（最长）且严格包含目标的允许根。
@@ -396,5 +475,47 @@ mod tests {
         assert!(p.check_delete(r"D:\cache\keep\x").is_err());
         // 删除 D:\cache 本身会连带删掉 keep
         assert!(p.check_delete(r"D:\cache").is_err());
+    }
+}
+
+#[cfg(test)]
+mod exclude_tests {
+    use super::*;
+
+    #[test]
+    fn user_exclusion_beats_allow_root() {
+        let mut p = SafetyPolicy::empty(PathStyle::Posix);
+        p.allow_root("/cache").unwrap();
+        p.exclude("/cache/keep").unwrap();
+        assert!(p.check_delete("/cache/a").is_ok());
+        assert!(p.check_delete("/cache/keep/x").is_err());
+        assert!(p.check_delete("/cache/keep").is_err());
+        // 祖先也不行，否则会连带删掉被排除的内容
+        let mut q = SafetyPolicy::empty(PathStyle::Posix);
+        q.exclude("/a/b/c").unwrap();
+        assert!(q.check_delete("/a/b").is_err());
+    }
+}
+
+#[cfg(test)]
+mod posix_tests {
+    use super::*;
+
+    #[test]
+    fn posix_style_follows_same_rules() {
+        let mut p = SafetyPolicy::empty(PathStyle::Posix);
+        p.protect("/home/u").unwrap();
+        p.allow_root("/home/u/.cache/tmp").unwrap();
+        p.allow_exact("/home/u/one.dmp").unwrap();
+        assert!(p.check_delete("/home/u/.cache/tmp/x").is_ok());
+        assert!(p.check_delete("/home/u/one.dmp").is_ok());
+        assert!(p.check_delete("/home/u/other").is_err());
+        assert!(p.check_delete("/home").is_err());
+        assert_eq!(p.check_delete("/"), Err(Denied::DriveRoot));
+        assert_eq!(p.check_delete("rel/x"), Err(Denied::NotAbsolute));
+        assert!(matches!(
+            p.check_delete("/data/repo/.git/x"),
+            Err(Denied::ProtectedName(_))
+        ));
     }
 }

@@ -83,7 +83,7 @@ impl Ctx<'_> {
     }
 }
 
-fn special_reason(meta: &Metadata) -> Option<SkipReason> {
+pub(crate) fn special_reason(meta: &Metadata) -> Option<SkipReason> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;

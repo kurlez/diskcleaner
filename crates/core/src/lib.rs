@@ -1,5 +1,9 @@
 //! diskclean 核心库：路径安全、扫描、（后续）规则与清理。与 GUI 解耦。
 
+pub mod builtin;
+pub mod cleaner;
+pub mod plan;
+pub mod rules;
 pub mod safety;
 pub mod scanner;
 
