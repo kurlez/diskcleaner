@@ -2,6 +2,7 @@
 
 pub mod builtin;
 pub mod cleaner;
+pub mod mft;
 pub mod plan;
 pub mod rules;
 pub mod safety;

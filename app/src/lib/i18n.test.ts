@@ -10,6 +10,8 @@ const RULE_IDS = [
 const SKIP_REASONS = [
   'denied', 'reparse_point', 'cloud_placeholder', 'too_new', 'protected_inside', 'non_utf8', 'io',
 ];
+// 扫描回退原因代码（后端 FastScanFn 返回）。
+const FALLBACK_CODES = ['access_denied', 'not_ntfs', 'path_not_found', 'other'];
 const ERROR_CODES = [
   'unsupported_platform', 'invalid_path', 'scan_failed', 'unknown_rule', 'no_plan', 'no_scan',
   'journal_failed', 'invalid_exclusion', 'settings_failed', 'policy', 'internal', 'unknown',
@@ -36,6 +38,7 @@ describe('locales', () => {
         expect(d[`rule.${id}.desc`], id).toBeTruthy();
       }
       for (const r of SKIP_REASONS) expect(d[`skip.${r}`], r).toBeTruthy();
+      for (const c of FALLBACK_CODES) expect(d[`scan.fallback.${c}`], c).toBeTruthy();
       for (const c of ERROR_CODES) expect(d[`err.${c}`], c).toBeTruthy();
     }
   });

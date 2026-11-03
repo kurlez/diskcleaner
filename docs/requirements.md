@@ -47,7 +47,7 @@
 | M1 | workspace、路径安全模块、遍历扫描器、CLI | 完成 |
 | M2 | 规则引擎 + Windows 规则集；预览/执行/回收站/日志/dry-run | 完成（待 Windows 真机验证） |
 | M3 | Tauri GUI（概览、扫描、目录树、清理向导、报告，中英双语） | 完成（待 Windows 真机验证） |
-| M4 | MFT 快速扫描；treemap；设置页 | 待做 |
+| M4 | MFT 快速扫描；treemap；设置页 | 完成（MFT 扫描待 Windows 真机验证） |
 | M5 | 重复文件、USN 增量、系统工具封装；打包签名 | 待做 |
 
 ## M2 设计要点
@@ -73,3 +73,16 @@
 - 安全：严格 CSP；capabilities 只开放事件监听；前端不加载任何外部资源。
 - 浏览器里 `npm run dev` 会使用 `lib/mock.ts` 的模拟数据预览界面；发布版不含 mock。
 - 暂未做：treemap 可视化与 MFT 快速扫描（M4）、"清空回收站"等系统动作（M5）。
+
+## M4 设计要点
+- **MFT 快速扫描**（`crates/core/src/mft.rs`）：基于 `ntfs` crate 顺序遍历 `$MFT`，只依赖 `Read + Seek`，
+  因此可用磁盘镜像在任何平台测试。原始卷读取经 4 KiB 对齐、1 MiB 预读的缓存读取器，满足裸卷对齐要求。
+- 大小语义：MFT 模式统计**磁盘占用**（已分配的簇，稀疏段不计）；遍历模式统计逻辑大小。界面用徽章标明当前方式。
+- 硬链接只出现一次且只算一次；DOS 8.3 短名、扩展记录、已删除记录被忽略；备用数据流与目录索引不计入。
+- 回退：非管理员（拒绝访问）、非 NTFS、路径不在索引中时，自动改用遍历扫描，并在界面提示原因。
+- 测试夹具：`crates/core/tests/fixtures/sample.ntfs.gz` 是用 ntfs-3g 生成的真实 NTFS 镜像
+  （嵌套目录、300 个小文件、硬链接、10 MiB 稀疏文件、中文名、已删除文件），
+  由 `make_ntfs_fixture.sh` 复现；`sample.expected.tsv` 是挂载后用 `find` 得到的期望清单。
+- **Treemap**：`lib/treemap.ts` 实现 squarified 算法（有单测：面积守恒、不重叠、长宽比、退化输入），
+  组件支持点击钻取、路径面包屑、过小条目合并为"其他 N 项"；与列表视图共享同一份后端扫描结果。
+- 暂未做：USN Journal 增量扫描（M5）；MFT 模式下的"已跳过"统计为空。

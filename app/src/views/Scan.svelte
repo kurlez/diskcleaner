@@ -4,6 +4,7 @@
   import { errorText, t } from '../lib/i18n.svelte';
   import { nav } from '../lib/nav.svelte';
   import TreeNode from '../components/TreeNode.svelte';
+  import Treemap from '../components/Treemap.svelte';
   import type { Child, ScanProgress, ScanSummary } from '../lib/types';
 
   let path = $state(nav.scanPath);
@@ -13,6 +14,8 @@
   let rootItems = $state<Child[]>([]);
   let rootHidden = $state(0);
   let error = $state('');
+  let view = $state<'list' | 'map'>('list');
+  let mapParts = $state<string[]>([]);
 
   async function start() {
     if (scanning || !path.trim()) return;
@@ -20,6 +23,7 @@
     error = '';
     summary = null;
     progress = null;
+    mapParts = [];
     const unlisten = await api.onScanProgress((p) => (progress = p));
     try {
       summary = await api.scanStart(path.trim());
@@ -73,11 +77,24 @@
   <div class="row summary">
     <strong class="big num">{t('scan.total', { size: formatSize(summary.total_size) })}</strong>
     <span class="muted num">{t('scan.files', { n: summary.file_count.toLocaleString() })}</span>
+    <span class="badge method {summary.method}" title={t(`scan.methodHint.${summary.method}`)}>{t(`scan.method.${summary.method}`)}</span>
+    <span class="grow"></span>
+    <div class="row seg" role="group" aria-label="View">
+      <button class:primary={view === 'list'} aria-pressed={view === 'list'} onclick={() => (view = 'list')}>{t('scan.view.list')}</button>
+      <button class:primary={view === 'map'} aria-pressed={view === 'map'} onclick={() => (view = 'map')}>{t('scan.view.map')}</button>
+    </div>
   </div>
+  {#if summary.fallback}<div class="note">{t(`scan.fallback.${summary.fallback}`)}</div>{/if}
   {#if summary.cancelled}<div class="note">{t('scan.cancelledNote')}</div>{/if}
   {#if summary.skipped > 0}<p class="muted small">{t('scan.skipped', { n: summary.skipped.toLocaleString() })}</p>{/if}
 
-  <div class="cols">
+  {#if view === 'map'}
+    <section class="card" style="margin-top:12px">
+      <Treemap rootName={summary.root} bind:parts={mapParts} />
+    </section>
+  {/if}
+
+  <div class="cols" hidden={view === 'map'}>
     <section class="card">
       <h2>{t('scan.tree')}</h2>
       <ul class="tree">
@@ -111,6 +128,12 @@
   .status { display: flex; flex-direction: column; gap: 6px; }
   .summary { margin: 8px 0; gap: 14px; }
   .big { font-size: 20px; }
+  .method.mft { background: var(--accent-soft); color: var(--accent); }
+  .note { margin-top: 8px; }
+  .cols[hidden] { display: none; }
+  .seg { gap: 0; }
+  .seg button:first-child { border-radius: 8px 0 0 8px; }
+  .seg button:last-child { border-radius: 0 8px 8px 0; margin-left: -1px; }
   .small { font-size: 12.5px; margin: 6px 0; }
   .cols { display: grid; grid-template-columns: minmax(0, 1.9fr) minmax(0, 1fr); gap: 16px; margin-top: 12px; align-items: start; }
   @media (max-width: 1080px) { .cols { grid-template-columns: 1fr; } }

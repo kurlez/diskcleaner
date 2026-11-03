@@ -22,6 +22,42 @@ struct AppState {
     journal_path: PathBuf,
 }
 
+/// Windows 下优先用 MFT 快速扫描；失败（非管理员、非 NTFS 等）由服务层回退到遍历。
+#[cfg(windows)]
+fn fast_scan() -> Option<Box<service::FastScanFn>> {
+    use diskclean_core::mft::{self, MftError};
+    Some(Box::new(|path, cancel, progress| {
+        let (letter, _) = path
+            .to_str()
+            .and_then(mft::split_drive_path)
+            .ok_or(("not_ntfs", "not a drive path".to_string()))?;
+        let vol = mft::open_volume(letter).map_err(|e| {
+            let code = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                "access_denied"
+            } else {
+                "other"
+            };
+            (code, e.to_string())
+        })?;
+        mft::scan_path(vol, path, cancel, progress).map_err(|e| {
+            let code = match &e {
+                MftError::NotNtfs(_) => "not_ntfs",
+                MftError::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied => {
+                    "access_denied"
+                }
+                MftError::PathNotFound => "path_not_found",
+                _ => "other",
+            };
+            (code, e.to_string())
+        })
+    }))
+}
+
+#[cfg(not(windows))]
+fn fast_scan() -> Option<Box<service::FastScanFn>> {
+    None
+}
+
 /// 生产环境的安全策略：Windows 默认保护名单 + 用户排除项。
 fn windows_policy(exclusions: &[String]) -> Result<SafetyPolicy, ApiError> {
     let dirs = KnownDirs::from_env().ok_or(ApiError::new("unsupported_platform"))?;
@@ -171,6 +207,7 @@ pub fn run() {
                 windows_rules(),
                 Env::from_process(),
                 Box::new(windows_policy),
+                fast_scan(),
             );
             app.manage(AppState {
                 svc: Arc::new(svc),

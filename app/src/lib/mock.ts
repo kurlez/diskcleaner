@@ -52,6 +52,7 @@ export const mockApi: Api = {
       listeners.scan.forEach((cb) => cb({ files, dirs: i * 1900, bytes: i * 14 * GB }));
     }
     return {
+      method: 'mft', fallback: null,
       root: path, total_size: 312 * GB, file_count: 852_000, skipped: 37, cancelled: cancelScan,
       top_files: [
         { path: 'C:\\Users\\alice\\Videos\\holiday-2025.mp4', size: 18 * GB },

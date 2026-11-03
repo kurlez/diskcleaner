@@ -14,7 +14,7 @@ use diskclean_core::cleaner::{execute, ExecOptions, Status};
 use diskclean_core::plan::{build_plan, Plan, PlanSkipReason};
 use diskclean_core::rules::{Disposal, Env, Risk, Rule};
 use diskclean_core::safety::SafetyPolicy;
-use diskclean_core::scanner::{self, Node, Progress};
+use diskclean_core::scanner::{self, Node, Progress, ScanOutcome};
 use serde::Serialize;
 
 const MAX_CHILDREN: usize = 1000;
@@ -68,6 +68,10 @@ pub struct FileDto {
 
 #[derive(Debug, Serialize)]
 pub struct ScanSummary {
+    /// `mft`（NTFS 快速扫描，大小为占用空间）或 `walk`（逐目录遍历，大小为逻辑大小）。
+    pub method: &'static str,
+    /// 想用快速扫描却回退到遍历时的原因代码（`access_denied`、`not_ntfs` 等）。
+    pub fallback: Option<&'static str>,
     pub root: String,
     pub total_size: u64,
     pub file_count: u64,
@@ -179,6 +183,15 @@ pub struct ExecRequest {
 
 pub type PolicyFactory = dyn Fn(&[String]) -> Result<SafetyPolicy> + Send + Sync;
 
+/// 快速扫描器：成功返回目录树，失败返回 (原因代码, 详情) 让服务层回退到遍历。
+pub type FastScanFn = dyn Fn(
+        &Path,
+        &AtomicBool,
+        &mut dyn FnMut(&Progress),
+    ) -> std::result::Result<ScanOutcome, (&'static str, String)>
+    + Send
+    + Sync;
+
 struct ScanState {
     root_path: PathBuf,
     root: Node,
@@ -188,6 +201,7 @@ pub struct Service {
     rules: Vec<Rule>,
     env: Env,
     policy_factory: Box<PolicyFactory>,
+    fast_scan: Option<Box<FastScanFn>>,
     scan: Mutex<Option<ScanState>>,
     plan: Mutex<Option<Plan>>,
     scan_cancel: Arc<AtomicBool>,
@@ -195,11 +209,17 @@ pub struct Service {
 }
 
 impl Service {
-    pub fn new(rules: Vec<Rule>, env: Env, policy_factory: Box<PolicyFactory>) -> Self {
+    pub fn new(
+        rules: Vec<Rule>,
+        env: Env,
+        policy_factory: Box<PolicyFactory>,
+        fast_scan: Option<Box<FastScanFn>>,
+    ) -> Self {
         Self {
             rules,
             env,
             policy_factory,
+            fast_scan,
             scan: Mutex::new(None),
             plan: Mutex::new(None),
             scan_cancel: Arc::new(AtomicBool::new(false)),
@@ -237,14 +257,36 @@ impl Service {
             return Err(ApiError::with("invalid_path", path));
         }
         self.scan_cancel.store(false, Ordering::Relaxed);
-        let out = scanner::scan(&root_path, &self.scan_cancel, &mut |p: &Progress| {
-            on_progress(ProgressDto {
-                files: p.files,
-                dirs: p.dirs,
-                bytes: p.bytes,
-            });
-        })
-        .map_err(|e| ApiError::with("scan_failed", e))?;
+
+        let mut method = "walk";
+        let mut fallback = None;
+        let mut fast = None;
+        if let Some(f) = &self.fast_scan {
+            match f(&root_path, &self.scan_cancel, &mut |p: &Progress| {
+                on_progress(ProgressDto {
+                    files: p.files,
+                    dirs: p.dirs,
+                    bytes: p.bytes,
+                });
+            }) {
+                Ok(out) => {
+                    method = "mft";
+                    fast = Some(out);
+                }
+                Err((code, _detail)) => fallback = Some(code),
+            }
+        }
+        let out = match fast {
+            Some(out) => out,
+            None => scanner::scan(&root_path, &self.scan_cancel, &mut |p: &Progress| {
+                on_progress(ProgressDto {
+                    files: p.files,
+                    dirs: p.dirs,
+                    bytes: p.bytes,
+                });
+            })
+            .map_err(|e| ApiError::with("scan_failed", e))?,
+        };
 
         let top_files = scanner::top_files(&root_path, &out.root, TOP_FILES)
             .into_iter()
@@ -254,6 +296,8 @@ impl Service {
             })
             .collect();
         let summary = ScanSummary {
+            method,
+            fallback,
             root: display_path(&root_path),
             total_size: out.root.size,
             file_count: out.root.file_count,
@@ -504,6 +548,10 @@ mod tests {
     }
 
     fn service(base: &Path) -> Service {
+        service_fast(base, None)
+    }
+
+    fn service_fast(base: &Path, fast: Option<Box<FastScanFn>>) -> Service {
         let rule = Rule {
             id: "r".into(),
             risk: Risk::Low,
@@ -531,6 +579,7 @@ mod tests {
             vec![rule],
             Env::from_pairs([("BASE", base.to_string_lossy())]),
             factory,
+            fast,
         )
     }
 
@@ -564,6 +613,65 @@ mod tests {
                 .unwrap(),
             d.join("a/big.bin")
         );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    fn fake_tree() -> ScanOutcome {
+        let file = |n: &str, size| Node {
+            name: n.into(),
+            is_dir: false,
+            size,
+            file_count: 1,
+            children: vec![],
+        };
+        ScanOutcome {
+            root: Node {
+                name: "root".into(),
+                is_dir: true,
+                size: 30,
+                file_count: 2,
+                children: vec![file("x.bin", 20), file("y.bin", 10)],
+            },
+            skipped: vec![],
+            cancelled: false,
+        }
+    }
+
+    #[test]
+    fn fast_scan_is_preferred_and_serves_children() {
+        let d = sandbox();
+        write(&d.join("walk-only.bin"), 999);
+        let svc = service_fast(&d, Some(Box::new(|_, _, _| Ok(fake_tree()))));
+        let s = svc.scan(d.to_str().unwrap(), &mut |_| {}).unwrap();
+        assert_eq!(s.method, "mft");
+        assert_eq!(s.fallback, None);
+        assert_eq!(s.total_size, 30);
+        let kids = svc.children(&[]).unwrap();
+        assert_eq!(kids.items[0].name, "x.bin");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn failed_fast_scan_falls_back_to_walking() {
+        let d = sandbox();
+        write(&d.join("a.bin"), 500);
+        let svc = service_fast(
+            &d,
+            Some(Box::new(|_, _, _| Err(("access_denied", "denied".into())))),
+        );
+        let s = svc.scan(d.to_str().unwrap(), &mut |_| {}).unwrap();
+        assert_eq!(s.method, "walk");
+        assert_eq!(s.fallback, Some("access_denied"));
+        assert_eq!(s.total_size, 500);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn no_fast_scanner_means_plain_walk_without_fallback_note() {
+        let d = sandbox();
+        write(&d.join("a.bin"), 1);
+        let s = service(&d).scan(d.to_str().unwrap(), &mut |_| {}).unwrap();
+        assert_eq!((s.method, s.fallback), ("walk", None));
         fs::remove_dir_all(&d).unwrap();
     }
 

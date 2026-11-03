@@ -6,6 +6,7 @@ export type Disposal = 'recycle' | 'permanent';
 export interface Drive { mount: string; name: string; fs: string; total: number; free: number }
 export interface FileEntry { path: string; size: number }
 export interface ScanSummary {
+  method: 'mft' | 'walk'; fallback: string | null;
   root: string; total_size: number; file_count: number; skipped: number;
   cancelled: boolean; top_files: FileEntry[];
 }
