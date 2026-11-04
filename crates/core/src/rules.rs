@@ -163,7 +163,7 @@ impl Target {
         if first.is_empty() || has_wildcard(&first) {
             return Vec::new();
         }
-        let Ok(base) = fs::canonicalize(&first) else {
+        let Ok(base) = crate::safety::canonical_plain(std::path::Path::new(&first)) else {
             return Vec::new();
         };
         let mut current = vec![base];

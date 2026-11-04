@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use diskclean_core::cleaner::{execute, execute_with, ExecOptions, Status};
 use diskclean_core::plan::{build_plan, PlanSkipReason};
 use diskclean_core::rules::{Disposal, Env, Risk, Rule, Target, TargetKind};
-use diskclean_core::safety::{PathStyle, SafetyPolicy};
+use diskclean_core::safety::SafetyPolicy;
 use diskclean_core::sysaction::ServiceControl;
 
 static N: AtomicU64 = AtomicU64::new(0);
@@ -26,7 +26,7 @@ impl Sandbox {
         let _ = fs::remove_dir_all(&raw);
         fs::create_dir_all(&raw).unwrap();
         Sandbox {
-            base: fs::canonicalize(raw).unwrap(),
+            base: diskclean_core::safety::canonical_plain(&raw).unwrap(),
         }
     }
     fn p(&self, rel: &str) -> PathBuf {
@@ -42,7 +42,7 @@ impl Sandbox {
         Env::from_pairs([("BASE", self.base.to_string_lossy())])
     }
     fn policy(&self) -> SafetyPolicy {
-        let mut p = SafetyPolicy::empty(PathStyle::Posix);
+        let mut p = SafetyPolicy::empty(diskclean_core::safety::native_style());
         // 整个沙箱默认受保护，只有规则目标会被放开。
         p.protect(self.base.to_str().unwrap()).unwrap();
         p

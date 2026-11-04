@@ -13,7 +13,7 @@ use diskclean_core::plan::PlanSkipReason;
 use diskclean_core::plan::{build_plan, Candidate, Plan};
 use diskclean_core::registry::{export_keys, to_utf16le_with_bom, Hive, MemRegistry, RegValue};
 use diskclean_core::rules::{Disposal, Env, Risk, Rule, Target, TargetKind};
-use diskclean_core::safety::{PathStyle, SafetyPolicy};
+use diskclean_core::safety::SafetyPolicy;
 use diskclean_core::scanner;
 
 static N: AtomicU64 = AtomicU64::new(0);
@@ -42,7 +42,7 @@ impl Sb {
         let d = std::env::temp_dir().join(format!("dc-uni-{}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
-        Sb(fs::canonicalize(d).unwrap())
+        Sb(diskclean_core::safety::canonical_plain(&d).unwrap())
     }
     fn p(&self, rel: &str) -> PathBuf {
         self.0.join(rel)
@@ -153,7 +153,7 @@ fn cleanup_journal_keeps_unicode_paths_readable() {
     let victim = sb.p("待清理/缓存 📦/临时文件.tmp");
     fs::create_dir_all(victim.parent().unwrap()).unwrap();
     fs::write(&victim, b"junk").unwrap();
-    let mut policy = SafetyPolicy::empty(PathStyle::Posix);
+    let mut policy = SafetyPolicy::empty(diskclean_core::safety::native_style());
     policy.protect(&sb.p("保护区").to_string_lossy()).unwrap();
     let plan = Plan::from_items(
         vec![Candidate {
@@ -248,7 +248,7 @@ fn rules_work_in_directories_with_unicode_names() {
     fs::write(target.join("子目录/文件.bin"), vec![1u8; 30]).unwrap();
     fs::write(target.join("根文件 📄.bin"), vec![1u8; 12]).unwrap();
     let env = Env::from_pairs([("BASE", sb.0.to_string_lossy())]);
-    let mut policy = SafetyPolicy::empty(PathStyle::Posix);
+    let mut policy = SafetyPolicy::empty(diskclean_core::safety::native_style());
     policy.protect(&sb.0.to_string_lossy()).unwrap();
     let plan = build_plan(
         &[rule("r", "%BASE%/用户 数据/缓存")],
@@ -300,7 +300,7 @@ fn invalid_encoding_in_a_file_name_is_survived_and_never_deleted() {
 
     // 清理：无法做安全校验的路径被跳过并保持原样；正常文件照常处理。
     let env = Env::from_pairs([("BASE", sb.0.to_string_lossy())]);
-    let mut policy = SafetyPolicy::empty(PathStyle::Posix);
+    let mut policy = SafetyPolicy::empty(diskclean_core::safety::native_style());
     policy.protect(&sb.0.to_string_lossy()).unwrap();
     let plan = build_plan(
         &[rule("r", "%BASE%/cache")],

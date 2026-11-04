@@ -1693,7 +1693,6 @@ pub fn delete_leftovers(
 mod tests {
     use super::*;
     use crate::registry::MemRegistry;
-    use crate::safety::PathStyle;
     use crate::sysaction::CmdOutput;
     use std::io;
     use Hive::{CurrentUser, LocalMachine};
@@ -2222,7 +2221,7 @@ mod tests {
             let _ = fs::remove_dir_all(&raw);
             let base = {
                 fs::create_dir_all(&raw).unwrap();
-                fs::canonicalize(&raw).unwrap()
+                crate::safety::canonical_plain(&raw).unwrap()
             };
             let mk = |p: &str| {
                 let d = base.join(p);
@@ -2248,7 +2247,7 @@ mod tests {
             p
         }
         fn policy(&self) -> SafetyPolicy {
-            let mut p = SafetyPolicy::empty(PathStyle::Posix);
+            let mut p = SafetyPolicy::empty(crate::safety::native_style());
             // 沙箱里的"系统"和"文档"目录受保护。
             p.protect(&self.base.join("Windows").to_string_lossy())
                 .unwrap();

@@ -2039,17 +2039,9 @@ fn skip_counts(plan: &Plan) -> Vec<SkipCount> {
 
 #[cfg(test)]
 mod tests {
-    /// 测试用的路径风格：Windows 上临时目录是 `C:\...`，必须用 Windows 风格才能匹配。
-    fn test_style() -> PathStyle {
-        if cfg!(windows) {
-            PathStyle::Windows
-        } else {
-            PathStyle::Posix
-        }
-    }
     use super::*;
     use diskclean_core::rules::{Target, TargetKind};
-    use diskclean_core::safety::PathStyle;
+    use diskclean_core::safety::native_style as test_style;
     use std::sync::atomic::AtomicU64;
 
     static N: AtomicU64 = AtomicU64::new(0);
@@ -2059,7 +2051,7 @@ mod tests {
         let d = std::env::temp_dir().join(format!("dc-svc-{}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
-        fs::canonicalize(d).unwrap()
+        diskclean_core::safety::canonical_plain(&d).unwrap()
     }
 
     fn service(base: &Path) -> Service {

@@ -1349,7 +1349,6 @@ pub fn journal_line(journal: &mut dyn Write, rec: &MigrationRecord, event: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::safety::PathStyle;
     use crate::sysaction::CmdOutput;
 
     static N: AtomicU64 = AtomicU64::new(0);
@@ -1365,7 +1364,7 @@ mod tests {
             let _ = fs::remove_dir_all(&raw);
             fs::create_dir_all(&raw).unwrap();
             Sb {
-                base: fs::canonicalize(raw).unwrap(),
+                base: crate::safety::canonical_plain(&raw).unwrap(),
             }
         }
         fn p(&self, rel: &str) -> PathBuf {
@@ -1377,7 +1376,7 @@ mod tests {
             fs::write(p, vec![7u8; n]).unwrap();
         }
         fn policy(&self) -> SafetyPolicy {
-            let mut p = SafetyPolicy::empty(PathStyle::Posix);
+            let mut p = SafetyPolicy::empty(crate::safety::native_style());
             p.protect(&self.p("Windows").to_string_lossy()).unwrap();
             p
         }

@@ -63,6 +63,30 @@ impl std::error::Error for Denied {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NormPath(Vec<String>);
 
+/// 当前平台的原生路径语法（Windows 上为 `Windows`，其余平台为 `Posix`），
+/// 用于对真实文件系统运行的测试。
+pub fn native_style() -> PathStyle {
+    if cfg!(windows) {
+        PathStyle::Windows
+    } else {
+        PathStyle::Posix
+    }
+}
+
+/// 规范化路径，并去掉 Windows 上 `canonicalize` 加的 `\\?\X:\` 扩展前缀，
+/// 使显示、比较与用户看到的路径一致；`\\?\UNC\` 等其他形式保持不变。
+pub fn canonical_plain(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let c = std::fs::canonicalize(path)?;
+    let s = c.to_string_lossy();
+    if let Some(rest) = s.strip_prefix("\\\\?\\") {
+        let b = rest.as_bytes();
+        if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+            return Ok(std::path::PathBuf::from(rest));
+        }
+    }
+    Ok(c)
+}
+
 /// 路径语法。生产环境使用 `Windows`；`Posix` 仅用于在非 Windows 平台上
 /// 对真实文件系统做集成测试，规则（受保护名称、前缀判断等）完全一致。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
