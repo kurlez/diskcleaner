@@ -9,7 +9,7 @@ export interface FileEntry { path: string; size: number }
 export interface ScanSummary {
   method: 'mft' | 'walk'; fallback: string | null; excluded: Excluded[];
   root: string; total_size: number; file_count: number; skipped: number;
-  cancelled: boolean; top_files: FileEntry[];
+  cancelled: boolean; elapsed_ms: number; top_files: FileEntry[];
 }
 export interface Child { name: string; size: number; is_dir: boolean; file_count: number }
 export interface Children { items: Child[]; hidden: number }

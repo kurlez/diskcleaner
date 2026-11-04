@@ -1,6 +1,6 @@
 <script lang="ts">
   import { api } from '../lib/api';
-  import { formatSize } from '../lib/format';
+  import { formatDuration, formatSize } from '../lib/format';
   import { errorText, t } from '../lib/i18n.svelte';
   import { nav } from '../lib/nav.svelte';
   import TreeNode from '../components/TreeNode.svelte';
@@ -17,6 +17,8 @@
   let path = $state(nav.scanPath);
   let scanning = $state(false);
   let progress = $state<ScanProgress | null>(null);
+  let elapsed = $state(0);
+  let timer: ReturnType<typeof setInterval> | undefined;
   let summary = $state<ScanSummary | null>(null);
   let rootItems = $state<Child[]>([]);
   let rootHidden = $state(0);
@@ -31,6 +33,9 @@
     error = '';
     summary = null;
     progress = null;
+    elapsed = 0;
+    const t0 = Date.now();
+    timer = setInterval(() => (elapsed = Date.now() - t0), 200);
     mapParts = [];
     clearCands(); // 新扫描会使旧的路径分量失效
     resetTree();
@@ -44,6 +49,7 @@
       error = errorText(e);
     } finally {
       unlisten();
+      clearInterval(timer);
       scanning = false;
     }
   }
@@ -102,11 +108,13 @@
     {#if progress}
       <p class="muted num">{t('scan.progress', { files: progress.files.toLocaleString(), dirs: progress.dirs.toLocaleString(), size: formatSize(progress.bytes) })}</p>
     {/if}
+    <p class="muted num">{t('scan.elapsed', { time: formatDuration(elapsed) })}</p>
   </div>
 {:else if summary}
   <div class="row summary">
     <strong class="big num">{t('scan.total', { size: formatSize(summary.total_size) })}</strong>
     <span class="muted num">{t('scan.files', { n: summary.file_count.toLocaleString() })}</span>
+    <span class="muted num">{t('scan.tookTime', { time: formatDuration(summary.elapsed_ms) })}</span>
     <span class="badge method {summary.method}" title={t(`scan.methodHint.${summary.method}`)}>{t(`scan.method.${summary.method}`)}</span>
     <span class="grow"></span>
     <div class="row seg" role="group" aria-label="View">

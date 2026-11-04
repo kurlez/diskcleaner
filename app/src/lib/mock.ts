@@ -40,7 +40,7 @@ function buildSummary(cancelled: boolean) {
   return {
     method: 'mft' as const, fallback: null,
     excluded: [{ path: 'C:\\Users\\alice\\OneDrive - Work', reason: 'OneDrive', size: 18 * GB }, { path: 'C:\\Users\\alice\\Dropbox', reason: 'Dropbox', size: 6 * GB }],
-    root: mockRoot, total_size: mockTotal, file_count: 852_000, skipped: 37, cancelled,
+    root: mockRoot, total_size: mockTotal, file_count: 852_000, skipped: 37, cancelled, elapsed_ms: 1_450,
     top_files: TOP_FILES_ALL.filter((f) => !removedPaths.has(f.path)),
   };
 }

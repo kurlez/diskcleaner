@@ -11,6 +11,18 @@ export function formatSize(bytes: number): string {
   return i === 0 ? `${bytes} B` : `${v.toFixed(1)} ${UNITS[i]}`;
 }
 
+/** 耗时：不足 1 秒显示毫秒，不足 1 分钟显示一位小数的秒，其后为 `m:ss`，满一小时为 `h:mm:ss`。 */
+export function formatDuration(ms: number): string {
+  if (ms < 1000) return `${Math.max(0, Math.round(ms))} ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)} s`;
+  const total = Math.floor(ms / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+
 /** 占比（0–100），分母为 0 时返回 0。 */
 export function percent(part: number, whole: number): number {
   if (whole <= 0) return 0;

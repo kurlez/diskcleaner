@@ -105,6 +105,8 @@ pub struct ScanSummary {
     /// 没有参与分析的云端/同步目录与自定义跳过的目录。
     pub excluded: Vec<ExcludedDto>,
     pub cancelled: bool,
+    /// 本次扫描的耗时（毫秒）。
+    pub elapsed_ms: u64,
     pub top_files: Vec<FileDto>,
 }
 
@@ -479,6 +481,7 @@ struct ScanState {
     fallback: Option<&'static str>,
     skipped: usize,
     excluded: Vec<scanner::Excluded>,
+    elapsed_ms: u64,
 }
 
 pub struct Service {
@@ -646,6 +649,7 @@ impl Service {
             return Err(ApiError::with("cloud_location", provider));
         }
         self.scan_cancel.store(false, Ordering::Relaxed);
+        let started = std::time::Instant::now();
         let filter = |p: &Path| rules.excluded_dir(p);
 
         let mut method = "walk";
@@ -692,6 +696,7 @@ impl Service {
             fallback,
             skipped: out.skipped.len(),
             excluded: out.excluded,
+            elapsed_ms: started.elapsed().as_millis() as u64,
         };
         let summary = summarize(&state, out.cancelled);
         *self.scan.lock().unwrap() = Some(state);
@@ -1815,6 +1820,7 @@ fn summarize(state: &ScanState, cancelled: bool) -> ScanSummary {
         skipped: state.skipped,
         excluded: excluded_dtos(&state.excluded),
         cancelled,
+        elapsed_ms: state.elapsed_ms,
         top_files,
     }
 }

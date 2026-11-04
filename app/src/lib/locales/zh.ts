@@ -31,6 +31,8 @@ export const zh: Record<string, string> = {
   'scan.cancel': '停止',
   'scan.scanning': '正在扫描…',
   'scan.progress': '已扫描 {files} 个文件 · {dirs} 个文件夹 · {size}',
+  'scan.elapsed': '已用时 {time}',
+  'scan.tookTime': '耗时 {time}',
   'scan.total': '总计 {size}',
   'scan.files': '{n} 个文件',
   'scan.skipped': '已跳过 {n} 项（链接、云端占位文件或无权限读取）',

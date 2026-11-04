@@ -31,6 +31,8 @@ export const en: Record<string, string> = {
   'scan.cancel': 'Stop',
   'scan.scanning': 'Scanning…',
   'scan.progress': '{files} files · {dirs} folders · {size} scanned',
+  'scan.elapsed': 'Elapsed {time}',
+  'scan.tookTime': 'took {time}',
   'scan.total': '{size} total',
   'scan.files': '{n} files',
   'scan.skipped': '{n} items skipped (links, cloud placeholders or no permission)',

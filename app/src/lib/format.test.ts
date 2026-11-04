@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatSize, joinPath, percent } from './format';
+import { formatDuration, formatSize, joinPath, percent } from './format';
 
 describe('formatSize', () => {
   it('matches the backend format', () => {
@@ -25,5 +25,16 @@ describe('joinPath', () => {
     expect(joinPath('C:\\', ['Users', 'a'])).toBe('C:\\Users\\a');
     expect(joinPath('C:\\Data', ['x'])).toBe('C:\\Data\\x');
     expect(joinPath('/tmp', ['x'])).toBe('/tmp/x');
+  });
+});
+
+describe('formatDuration', () => {
+  it('picks a readable unit', () => {
+    expect(formatDuration(0)).toBe('0 ms');
+    expect(formatDuration(480)).toBe('480 ms');
+    expect(formatDuration(1500)).toBe('1.5 s');
+    expect(formatDuration(59_000)).toBe('59.0 s');
+    expect(formatDuration(75_000)).toBe('1:15');
+    expect(formatDuration(3_725_000)).toBe('1:02:05');
   });
 });

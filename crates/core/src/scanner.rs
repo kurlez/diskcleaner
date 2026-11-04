@@ -9,12 +9,18 @@ use std::collections::BinaryHeap;
 use std::fs::{self, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
+
+use rayon::prelude::*;
 
 pub use crate::cloud::Excluded;
 
 const MAX_DEPTH: usize = 512;
-const PROGRESS_EVERY: u64 = 1000;
+/// 并行遍历的线程数：瓶颈是文件系统等待而不是 CPU，所以可以多于核数。
+const SCAN_THREADS: usize = 16;
+const WORKER_STACK: usize = 32 * 1024 * 1024;
+const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
@@ -62,29 +68,30 @@ pub struct ScanOutcome {
 }
 
 /// 决定一个目录是否跳过：返回原因（`Some`）表示跳过。
-pub type DirFilter<'a> = &'a dyn Fn(&Path) -> Option<String>;
+pub type DirFilter<'a> = &'a (dyn Fn(&Path) -> Option<String> + Sync);
 
-struct Ctx<'a> {
+/// 各工作线程共享的扫描状态；计数用原子量，进度由调用线程定时读取。
+struct Shared<'a> {
     filter: Option<DirFilter<'a>>,
-    excluded: Vec<Excluded>,
     cancel: &'a AtomicBool,
-    on_progress: &'a mut dyn FnMut(&Progress),
-    progress: Progress,
-    skipped: Vec<Skipped>,
-    since_report: u64,
+    files: AtomicU64,
+    dirs: AtomicU64,
+    bytes: AtomicU64,
+    skipped: Mutex<Vec<Skipped>>,
+    excluded: Mutex<Vec<Excluded>>,
 }
 
-impl Ctx<'_> {
-    fn tick(&mut self) {
-        self.since_report += 1;
-        if self.since_report >= PROGRESS_EVERY {
-            self.since_report = 0;
-            (self.on_progress)(&self.progress);
+impl Shared<'_> {
+    fn snapshot(&self) -> Progress {
+        Progress {
+            files: self.files.load(Ordering::Relaxed),
+            dirs: self.dirs.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
         }
     }
 
-    fn skip(&mut self, path: PathBuf, reason: SkipReason, detail: Option<String>) {
-        self.skipped.push(Skipped {
+    fn skip(&self, path: PathBuf, reason: SkipReason, detail: Option<String>) {
+        self.skipped.lock().unwrap().push(Skipped {
             path,
             reason,
             detail,
@@ -137,30 +144,48 @@ pub fn scan_filtered(
             "scan root must be a real directory",
         ));
     }
-    let mut ctx = Ctx {
+    let shared = Shared {
         filter,
-        excluded: Vec::new(),
         cancel,
-        on_progress,
-        progress: Progress::default(),
-        skipped: Vec::new(),
-        since_report: 0,
+        files: AtomicU64::new(0),
+        dirs: AtomicU64::new(0),
+        bytes: AtomicU64::new(0),
+        skipped: Mutex::new(Vec::new()),
+        excluded: Mutex::new(Vec::new()),
     };
     let name = root
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| root.to_string_lossy().into_owned());
-    let node = walk(root, name, 0, &mut ctx);
-    (ctx.on_progress)(&ctx.progress);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(SCAN_THREADS)
+        .stack_size(WORKER_STACK)
+        .build()
+        .map_err(io::Error::other)?;
+    let node = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| pool.install(|| walk(root, name, 0, &shared)));
+        while !worker.is_finished() {
+            std::thread::sleep(PROGRESS_INTERVAL);
+            on_progress(&shared.snapshot());
+        }
+        worker.join()
+    })
+    .map_err(|_| io::Error::other("scan worker panicked"))?;
+    on_progress(&shared.snapshot());
+    let mut skipped = shared.skipped.into_inner().unwrap();
+    let mut excluded = shared.excluded.into_inner().unwrap();
+    // 并行遍历的发现顺序不固定，排序后结果才可复现。
+    skipped.sort_by(|a, b| a.path.cmp(&b.path));
+    excluded.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(ScanOutcome {
         root: node,
-        skipped: ctx.skipped,
-        excluded: ctx.excluded,
+        skipped,
+        excluded,
         cancelled: cancel.load(Ordering::Relaxed),
     })
 }
 
-fn walk(path: &Path, name: String, depth: usize, ctx: &mut Ctx) -> Node {
+fn walk(path: &Path, name: String, depth: usize, sh: &Shared) -> Node {
     let mut node = Node {
         name,
         is_dir: true,
@@ -168,10 +193,10 @@ fn walk(path: &Path, name: String, depth: usize, ctx: &mut Ctx) -> Node {
         file_count: 0,
         children: Vec::new(),
     };
-    ctx.progress.dirs += 1;
+    sh.dirs.fetch_add(1, Ordering::Relaxed);
 
     if depth >= MAX_DEPTH {
-        ctx.skip(
+        sh.skip(
             path.to_path_buf(),
             SkipReason::Error,
             Some("directory nesting too deep".into()),
@@ -181,19 +206,20 @@ fn walk(path: &Path, name: String, depth: usize, ctx: &mut Ctx) -> Node {
     let entries = match fs::read_dir(path) {
         Ok(e) => e,
         Err(e) => {
-            ctx.skip(path.to_path_buf(), SkipReason::Error, Some(e.to_string()));
+            sh.skip(path.to_path_buf(), SkipReason::Error, Some(e.to_string()));
             return node;
         }
     };
 
+    let mut subdirs: Vec<(PathBuf, String)> = Vec::new();
     for entry in entries {
-        if ctx.cancel.load(Ordering::Relaxed) {
+        if sh.cancel.load(Ordering::Relaxed) {
             break;
         }
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                ctx.skip(path.to_path_buf(), SkipReason::Error, Some(e.to_string()));
+                sh.skip(path.to_path_buf(), SkipReason::Error, Some(e.to_string()));
                 continue;
             }
         };
@@ -202,34 +228,28 @@ fn walk(path: &Path, name: String, depth: usize, ctx: &mut Ctx) -> Node {
         let meta = match entry.metadata() {
             Ok(m) => m,
             Err(e) => {
-                ctx.skip(child_path, SkipReason::Error, Some(e.to_string()));
+                sh.skip(child_path, SkipReason::Error, Some(e.to_string()));
                 continue;
             }
         };
         if let Some(reason) = special_reason(&meta) {
-            ctx.skip(child_path, reason, None);
+            sh.skip(child_path, reason, None);
             continue;
         }
         let child_name = entry.file_name().to_string_lossy().into_owned();
         if meta.is_dir() {
-            if let Some(reason) = ctx.filter.and_then(|f| f(&child_path)) {
-                ctx.excluded.push(Excluded {
+            if let Some(reason) = sh.filter.and_then(|f| f(&child_path)) {
+                sh.excluded.lock().unwrap().push(Excluded {
                     path: child_path,
                     reason,
                     size: 0,
                 });
                 continue;
             }
-        }
-        ctx.tick();
-        if meta.is_dir() {
-            let child = walk(&child_path, child_name, depth + 1, ctx);
-            node.size += child.size;
-            node.file_count += child.file_count;
-            node.children.push(child);
+            subdirs.push((child_path, child_name));
         } else {
-            ctx.progress.files += 1;
-            ctx.progress.bytes += meta.len();
+            sh.files.fetch_add(1, Ordering::Relaxed);
+            sh.bytes.fetch_add(meta.len(), Ordering::Relaxed);
             node.size += meta.len();
             node.file_count += 1;
             node.children.push(Node {
@@ -240,6 +260,16 @@ fn walk(path: &Path, name: String, depth: usize, ctx: &mut Ctx) -> Node {
                 children: Vec::new(),
             });
         }
+    }
+    // 子目录交给线程池并行处理（工作窃取，深浅不一的目录树也能均衡）。
+    let dirs: Vec<Node> = subdirs
+        .into_par_iter()
+        .map(|(p, n)| walk(&p, n, depth + 1, sh))
+        .collect();
+    for child in dirs {
+        node.size += child.size;
+        node.file_count += child.file_count;
+        node.children.push(child);
     }
     node.children
         .sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
@@ -402,7 +432,6 @@ pub fn replace_path(node: &mut Node, parts: &[String], mut new: Node) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU64;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -732,5 +761,35 @@ mod tests {
         assert!(prune_excluded(&mut tree, &d, &cloud_filter).is_empty());
         assert_eq!(tree.size, 10);
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn parallel_walk_totals_match_a_wide_and_deep_tree() {
+        let base = std::env::temp_dir().join(format!("dc-par-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let (mut files, mut bytes) = (0u64, 0u64);
+        for a in 0..12 {
+            for b in 0..12 {
+                let d = base.join(format!("a{a}/b{b}/c/d"));
+                fs::create_dir_all(&d).unwrap();
+                for f in 0..5 {
+                    let n = (a * 100 + b * 10 + f + 1) as usize;
+                    fs::write(d.join(format!("f{f}.bin")), vec![1u8; n]).unwrap();
+                    files += 1;
+                    bytes += n as u64;
+                }
+            }
+        }
+        let mut reports = 0;
+        let out = scan(&base, &AtomicBool::new(false), &mut |_| reports += 1).unwrap();
+        assert_eq!(out.root.file_count, files);
+        assert_eq!(out.root.size, bytes);
+        assert!(reports >= 1, "final progress is always reported");
+        // 每一层都按大小降序，结果与线程调度无关。
+        fn sorted(n: &Node) -> bool {
+            n.children.windows(2).all(|w| w[0].size >= w[1].size) && n.children.iter().all(sorted)
+        }
+        assert!(sorted(&out.root));
+        fs::remove_dir_all(&base).unwrap();
     }
 }
