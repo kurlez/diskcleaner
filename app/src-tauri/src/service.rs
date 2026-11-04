@@ -2864,7 +2864,12 @@ mod tests {
         let by_path = |needle: &str| {
             left.items
                 .iter()
-                .find(|i| i.path.replace('\\', "/").contains(needle) && i.value_name.is_none())
+                .find(|i| {
+                    i.path
+                        .replace('\\', "/")
+                        .contains(&needle.replace('\\', "/"))
+                        && i.value_name.is_none()
+                })
                 .unwrap_or_else(|| panic!("{needle} not found in {:#?}", left.items))
         };
         assert_eq!(by_path("PF/Foo").kind, "folder");
