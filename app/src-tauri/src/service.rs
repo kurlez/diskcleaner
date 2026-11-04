@@ -107,6 +107,8 @@ pub struct ScanSummary {
     pub cancelled: bool,
     /// 本次扫描的耗时（毫秒）。
     pub elapsed_ms: u64,
+    /// 小于该大小的项目没有单独列出（0 表示全部列出）。
+    pub min_size: u64,
     pub top_files: Vec<FileDto>,
 }
 
@@ -123,6 +125,9 @@ pub struct ChildrenDto {
     pub items: Vec<ChildDto>,
     /// 因数量上限而未返回的子项个数。
     pub hidden: usize,
+    /// 这个目录下因小于"最小显示大小"而没有单独列出的项目：总大小与文件数。
+    pub small_size: u64,
+    pub small_files: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -482,6 +487,7 @@ struct ScanState {
     skipped: usize,
     excluded: Vec<scanner::Excluded>,
     elapsed_ms: u64,
+    min_size: u64,
 }
 
 pub struct Service {
@@ -613,7 +619,7 @@ impl Service {
         path: &str,
         on_progress: &mut dyn FnMut(ProgressDto),
     ) -> Result<ScanSummary> {
-        self.scan_with(path, &self.default_cloud_rules(), on_progress)
+        self.scan_with(path, 0, &self.default_cloud_rules(), on_progress)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -638,6 +644,7 @@ impl Service {
     pub fn scan_with(
         &self,
         path: &str,
+        min_size: u64,
         rules: &CloudRules,
         on_progress: &mut dyn FnMut(ProgressDto),
     ) -> Result<ScanSummary> {
@@ -672,7 +679,7 @@ impl Service {
                 Err((code, _detail)) => fallback = Some(code),
             }
         }
-        let out = match fast {
+        let mut out = match fast {
             Some(out) => out,
             None => scanner::scan_filtered(
                 &root_path,
@@ -689,6 +696,8 @@ impl Service {
             .map_err(|e| ApiError::with("scan_failed", e))?,
         };
 
+        // 只列出大头：小文件/小目录的大小仍计入上级，但不再单独保留。
+        scanner::prune_small(&mut out.root, min_size);
         let state = ScanState {
             root_path,
             root: out.root,
@@ -697,6 +706,7 @@ impl Service {
             skipped: out.skipped.len(),
             excluded: out.excluded,
             elapsed_ms: started.elapsed().as_millis() as u64,
+            min_size,
         };
         let summary = summarize(&state, out.cancelled);
         *self.scan.lock().unwrap() = Some(state);
@@ -781,6 +791,12 @@ impl Service {
         Ok(ChildrenDto {
             items,
             hidden: node.children.len().saturating_sub(MAX_CHILDREN),
+            small_size: node
+                .size
+                .saturating_sub(node.children.iter().map(|c| c.size).sum()),
+            small_files: node
+                .file_count
+                .saturating_sub(node.children.iter().map(|c| c.file_count).sum()),
         })
     }
 
@@ -1821,6 +1837,7 @@ fn summarize(state: &ScanState, cancelled: bool) -> ScanSummary {
         excluded: excluded_dtos(&state.excluded),
         cancelled,
         elapsed_ms: state.elapsed_ms,
+        min_size: state.min_size,
         top_files,
     }
 }
@@ -4137,7 +4154,7 @@ mod tests {
         let env = Env::from_pairs([("X", "y")]);
         let on = CloudRules::new(true, &[], &env);
         assert_eq!(
-            svc.scan_with(d.to_str().unwrap(), &on, &mut |_| {})
+            svc.scan_with(d.to_str().unwrap(), 0, &on, &mut |_| {})
                 .unwrap()
                 .total_size,
             15_099
@@ -4148,7 +4165,7 @@ mod tests {
             &env,
         );
         let sum = svc
-            .scan_with(d.to_str().unwrap(), &custom, &mut |_| {})
+            .scan_with(d.to_str().unwrap(), 0, &custom, &mut |_| {})
             .unwrap();
         assert_eq!(sum.total_size, 10_099, "自定义跳过的路径始终生效");
         assert_eq!(sum.excluded.len(), 1);
@@ -4229,7 +4246,12 @@ mod tests {
         // 打开"分析云端"后允许。
         let on = CloudRules::new(true, &[], &Env::default());
         assert!(svc
-            .scan_with(&d.join("Google Drive").to_string_lossy(), &on, &mut |_| {})
+            .scan_with(
+                &d.join("Google Drive").to_string_lossy(),
+                0,
+                &on,
+                &mut |_| {}
+            )
             .is_ok());
 
         // 虚拟盘符：卷标是 Google Drive。
@@ -4312,6 +4334,36 @@ mod tests {
             .iter()
             .any(|i| i.code == "cloud_location" && i.severity == "error"));
         assert!(!p.can_proceed);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn items_below_the_minimum_size_are_folded_into_their_parent() {
+        let d = sandbox();
+        for i in 0..5 {
+            write(&d.join(format!("proj/small{i}.txt")), 100);
+        }
+        write(&d.join("proj/big.bin"), 5000);
+        write(&d.join("tiny_dir/a.txt"), 50);
+        let svc = service(&d);
+        let sum = svc
+            .scan_with(
+                d.to_str().unwrap(),
+                1000,
+                &svc.default_cloud_rules(),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(sum.min_size, 1000);
+        assert_eq!(sum.total_size, 5000 + 500 + 50, "总量仍然完整");
+        let root = svc.children(&[]).unwrap();
+        let names: Vec<_> = root.items.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["proj"], "小目录不再单独列出");
+        assert_eq!(root.small_size, 50);
+        let proj = svc.children(&["proj".to_string()]).unwrap();
+        assert_eq!(proj.items.len(), 1);
+        assert_eq!(proj.small_size, 500);
+        assert_eq!(proj.small_files, 5);
         fs::remove_dir_all(&d).unwrap();
     }
 }

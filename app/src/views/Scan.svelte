@@ -5,6 +5,7 @@
   import { nav } from '../lib/nav.svelte';
   import TreeNode from '../components/TreeNode.svelte';
   import Treemap from '../components/Treemap.svelte';
+  import PieChart from '../components/PieChart.svelte';
   import CandidatePanel from '../components/CandidatePanel.svelte';
   import TopFiles from '../components/TopFiles.svelte';
   import Icon from '../components/Icon.svelte';
@@ -18,12 +19,14 @@
   let scanning = $state(false);
   let progress = $state<ScanProgress | null>(null);
   let elapsed = $state(0);
+  let minSizeMb = $state(1);
+  let rootSmall = $state({ size: 0, files: 0 });
   let timer: ReturnType<typeof setInterval> | undefined;
   let summary = $state<ScanSummary | null>(null);
   let rootItems = $state<Child[]>([]);
   let rootHidden = $state(0);
   let error = $state('');
-  let view = $state<'list' | 'map'>('list');
+  let view = $state<'list' | 'map' | 'pie'>('pie');
   let mapParts = $state<string[]>([]);
   let treeVersion = $state(0);
 
@@ -41,10 +44,11 @@
     resetTree();
     const unlisten = await api.onScanProgress((p) => (progress = p));
     try {
-      summary = await api.scanStart(path.trim());
+      summary = await api.scanStart(path.trim(), Math.max(0, Math.floor(Number(minSizeMb) || 0)));
       const c = await api.scanChildren([]);
       rootItems = c.items;
       rootHidden = c.hidden;
+      rootSmall = { size: c.small_size, files: c.small_files };
     } catch (e) {
       error = errorText(e);
     } finally {
@@ -67,6 +71,7 @@
         const c = await api.scanChildren([]);
         rootItems = c.items;
         rootHidden = c.hidden;
+        rootSmall = { size: c.small_size, files: c.small_files };
         treeVersion++;
       } catch {
         /* 没有扫描结果（比如已被新的扫描替换）时忽略 */
@@ -93,6 +98,11 @@
     <span class="muted">{t('scan.path')}</span>
     <input type="text" class="grow" bind:value={path} placeholder={t('scan.pathPlaceholder')} disabled={scanning} spellcheck="false" />
   </label>
+  <label class="row" title={t('scan.minSizeHint')}>
+    <span class="muted">{t('scan.minSize')}</span>
+    <input type="number" min="0" step="1" class="mini" bind:value={minSizeMb} disabled={scanning} />
+    <span class="muted">MB</span>
+  </label>
   {#if scanning}
     <button type="button" onclick={() => api.scanCancel()}>{t('scan.cancel')}</button>
   {:else}
@@ -118,6 +128,7 @@
     <span class="badge method {summary.method}" title={t(`scan.methodHint.${summary.method}`)}>{t(`scan.method.${summary.method}`)}</span>
     <span class="grow"></span>
     <div class="row seg" role="group" aria-label="View">
+      <button class:primary={view === 'pie'} aria-pressed={view === 'pie'} onclick={() => (view = 'pie')}>{t('scan.view.pie')}</button>
       <button class:primary={view === 'list'} aria-pressed={view === 'list'} onclick={() => (view = 'list')}>{t('scan.view.list')}</button>
       <button class:primary={view === 'map'} aria-pressed={view === 'map'} onclick={() => (view = 'map')}>{t('scan.view.map')}</button>
     </div>
@@ -137,13 +148,21 @@
   {/if}
   {#if summary.skipped > 0}<p class="muted small">{t('scan.skipped', { n: summary.skipped.toLocaleString() })}</p>{/if}
 
+  {#if summary.min_size > 0}<p class="muted small">{t('scan.minNote', { size: formatSize(summary.min_size) })}</p>{/if}
+
+  {#if view === 'pie'}
+    <section class="card" style="margin-top:12px">
+      <PieChart rootName={summary.root} bind:parts={mapParts} />
+    </section>
+  {/if}
+
   {#if view === 'map'}
     <section class="card" style="margin-top:12px">
       <Treemap rootName={summary.root} bind:parts={mapParts} />
     </section>
   {/if}
 
-  <div class="cols" hidden={view === 'map'}>
+  <div class="cols" hidden={view !== 'list'}>
     <section class="card">
       <h2>{t('scan.tree')}</h2>
       <ul class="tree">
@@ -153,6 +172,7 @@
           {/each}
         {/key}
       </ul>
+      {#if rootSmall.size > 0}<p class="muted small">{t('scan.smallFolded', { n: rootSmall.files.toLocaleString(), size: formatSize(rootSmall.size) })}</p>{/if}
       {#if rootHidden > 0}<p class="muted small">{t('scan.hidden', { n: rootHidden })}</p>{/if}
     </section>
 
@@ -172,6 +192,7 @@
   .bar-row { margin-bottom: 16px; }
   .bar-row label { gap: 10px; }
   .status { display: flex; flex-direction: column; gap: 6px; }
+  .mini { width: 64px; }
   .summary { margin: 8px 0; gap: 14px; }
   .big { font-size: 20px; }
   .excl { margin-top: 8px; }

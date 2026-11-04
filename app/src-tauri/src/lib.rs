@@ -206,13 +206,19 @@ async fn scan_start(
     app: AppHandle,
     state: State<'_, AppState>,
     path: String,
+    min_size_mb: u64,
 ) -> Result<ScanSummary, ApiError> {
     let svc = state.svc.clone();
     let rules = cloud_rules(&state);
     blocking(move || {
-        svc.scan_with(&path, &rules, &mut |p| {
-            let _ = app.emit("scan-progress", p);
-        })
+        svc.scan_with(
+            &path,
+            min_size_mb.saturating_mul(1024 * 1024),
+            &rules,
+            &mut |p| {
+                let _ = app.emit("scan-progress", p);
+            },
+        )
     })
     .await
 }

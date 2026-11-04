@@ -6,7 +6,7 @@ const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 
 const real: Api = {
   listDrives: () => invoke('list_drives'),
-  scanStart: (path) => invoke('scan_start', { path }),
+  scanStart: (path, minSizeMb) => invoke('scan_start', { path, minSizeMb }),
   scanCancel: () => invoke('scan_cancel'),
   scanCurrent: () => invoke('scan_current'),
   scanChildren: (parts) => invoke('scan_children', { parts }),

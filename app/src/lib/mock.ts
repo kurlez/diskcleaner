@@ -36,11 +36,13 @@ const TOP_FILES_ALL = [
   ];
 
 /** 由当前（可能已被清理修改过的）模拟数据生成扫描摘要。 */
+let mockMin = 1024 * 1024;
+
 function buildSummary(cancelled: boolean) {
   return {
     method: 'mft' as const, fallback: null,
     excluded: [{ path: 'C:\\Users\\alice\\OneDrive - Work', reason: 'OneDrive', size: 18 * GB }, { path: 'C:\\Users\\alice\\Dropbox', reason: 'Dropbox', size: 6 * GB }],
-    root: mockRoot, total_size: mockTotal, file_count: 852_000, skipped: 37, cancelled, elapsed_ms: 1_450,
+    root: mockRoot, total_size: mockTotal, file_count: 852_000, skipped: 37, cancelled, elapsed_ms: 1_450, min_size: mockMin,
     top_files: TOP_FILES_ALL.filter((f) => !removedPaths.has(f.path)),
   };
 }
@@ -138,8 +140,9 @@ export const mockApi: Api = {
       { mount: 'G:\\', name: 'Google Drive', fs: 'NTFS', total: 2048 * GB, free: 1500 * GB, cloud: 'Google Drive' },
     ];
   },
-  async scanStart(path) {
+  async scanStart(path, minSizeMb) {
     cancelScan = false;
+    mockMin = minSizeMb * 1024 * 1024;
     let files = 0;
     for (let i = 1; i <= 12 && !cancelScan; i++) {
       await sleep(120);
@@ -155,7 +158,7 @@ export const mockApi: Api = {
   async scanCurrent() { return buildSummary(false); },
   async scanChildren(parts) {
     await sleep(80);
-    return { items: tree[parts.join('\u0000')] ?? [], hidden: 0 };
+    return { items: tree[parts.join('\u0000')] ?? [], hidden: 0, small_size: mockMin > 0 ? 640 * MB : 0, small_files: mockMin > 0 ? 18_400 : 0 };
   },
   async reveal() {},
   async rulesList() { return rules; },

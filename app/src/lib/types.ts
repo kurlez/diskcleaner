@@ -9,10 +9,10 @@ export interface FileEntry { path: string; size: number }
 export interface ScanSummary {
   method: 'mft' | 'walk'; fallback: string | null; excluded: Excluded[];
   root: string; total_size: number; file_count: number; skipped: number;
-  cancelled: boolean; elapsed_ms: number; top_files: FileEntry[];
+  cancelled: boolean; elapsed_ms: number; min_size: number; top_files: FileEntry[];
 }
 export interface Child { name: string; size: number; is_dir: boolean; file_count: number }
-export interface Children { items: Child[]; hidden: number }
+export interface Children { items: Child[]; hidden: number; small_size: number; small_files: number }
 export interface Rule { id: string; risk: Risk; default_selected: boolean; disposal: Disposal }
 export interface RuleTotal { rule_id: string; size: number; files: number }
 export interface SkipCount { reason: string; count: number }
@@ -85,7 +85,7 @@ export interface ApiError { code: string; detail?: string | null }
 
 export interface Api {
   listDrives(): Promise<Drive[]>;
-  scanStart(path: string): Promise<ScanSummary>;
+  scanStart(path: string, minSizeMb: number): Promise<ScanSummary>;
   scanCancel(): Promise<void>;
   scanCurrent(): Promise<ScanSummary>;
   scanChildren(parts: string[]): Promise<Children>;

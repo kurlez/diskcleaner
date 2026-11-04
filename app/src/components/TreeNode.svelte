@@ -7,7 +7,7 @@
   import { isExpanded, setExpanded } from '../lib/tree.svelte';
   import { onMount } from 'svelte';
   import Icon from './Icon.svelte';
-  import type { Child } from '../lib/types';
+  import type { Child, Children } from '../lib/types';
   import TreeNode from './TreeNode.svelte';
 
   let { item, parentParts, parentSize, depth = 0 }: {
@@ -17,7 +17,7 @@
   let open = $state(false);
   let loading = $state(false);
   let error = $state('');
-  let kids = $state<{ items: Child[]; hidden: number } | null>(null);
+  let kids = $state<Children | null>(null);
 
   const parts = $derived([...parentParts, item.name]);
   const picked = $derived(hasCand(parts));
@@ -93,6 +93,9 @@
         {:else}
           <li class="muted" style="padding-left:{(depth + 1) * 18 + 24}px">{t('scan.emptyDir')}</li>
         {/each}
+        {#if kids.small_size > 0}
+          <li class="muted small" style="padding-left:{(depth + 1) * 18 + 24}px">{t('scan.smallFolded', { n: kids.small_files.toLocaleString(), size: formatSize(kids.small_size) })}</li>
+        {/if}
         {#if kids.hidden > 0}
           <li class="muted" style="padding-left:{(depth + 1) * 18 + 24}px">{t('scan.hidden', { n: kids.hidden })}</li>
         {/if}

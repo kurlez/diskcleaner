@@ -276,6 +276,21 @@ fn walk(path: &Path, name: String, depth: usize, sh: &Shared) -> Node {
     node
 }
 
+/// 去掉小于 `min_size` 的文件和目录节点（它们的大小仍计入上级，只是不再单独列出），
+/// 返回被去掉的节点数。小目录整棵子树一起去掉，所以界面与内存里只剩大头。
+pub fn prune_small(node: &mut Node, min_size: u64) -> usize {
+    if min_size == 0 {
+        return 0;
+    }
+    let before = node.children.len();
+    node.children.retain(|c| c.size >= min_size);
+    let mut removed = before - node.children.len();
+    for c in &mut node.children {
+        removed += prune_small(c, min_size);
+    }
+    removed
+}
+
 /// 取最大的 `n` 个文件（含完整路径），按大小降序。
 pub fn top_files(root_path: &Path, root: &Node, n: usize) -> Vec<(PathBuf, u64)> {
     if n == 0 {
@@ -791,5 +806,35 @@ mod tests {
         }
         assert!(sorted(&out.root));
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn small_items_are_pruned_but_still_counted_in_their_parents() {
+        let f = |n: &str, size: u64| Node {
+            name: n.into(),
+            is_dir: false,
+            size,
+            file_count: 1,
+            children: vec![],
+        };
+        let small_dir = Node {
+            name: "sd".into(),
+            is_dir: true,
+            size: 300,
+            file_count: 2,
+            children: vec![f("x", 100), f("y", 200)],
+        };
+        let mut root = Node {
+            name: "r".into(),
+            is_dir: true,
+            size: 5000 + 300 + 10,
+            file_count: 4,
+            children: vec![f("big", 5000), small_dir, f("tiny", 10)],
+        };
+        assert_eq!(prune_small(&mut root, 1000), 2);
+        assert_eq!(root.children.len(), 1);
+        assert_eq!(root.children[0].name, "big");
+        assert_eq!(root.size, 5310, "上级大小不变");
+        assert_eq!(prune_small(&mut root, 0), 0);
     }
 }
