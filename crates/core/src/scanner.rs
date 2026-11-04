@@ -11,6 +11,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+pub use crate::cloud::Excluded;
+
 const MAX_DEPTH: usize = 512;
 const PROGRESS_EVERY: u64 = 1000;
 
@@ -54,10 +56,17 @@ pub struct Progress {
 pub struct ScanOutcome {
     pub root: Node,
     pub skipped: Vec<Skipped>,
+    /// 因为是云端/同步目录或用户自定义跳过而没有分析的目录。
+    pub excluded: Vec<Excluded>,
     pub cancelled: bool,
 }
 
+/// 决定一个目录是否跳过：返回原因（`Some`）表示跳过。
+pub type DirFilter<'a> = &'a dyn Fn(&Path) -> Option<String>;
+
 struct Ctx<'a> {
+    filter: Option<DirFilter<'a>>,
+    excluded: Vec<Excluded>,
     cancel: &'a AtomicBool,
     on_progress: &'a mut dyn FnMut(&Progress),
     progress: Progress,
@@ -111,6 +120,16 @@ pub fn scan(
     cancel: &AtomicBool,
     on_progress: &mut dyn FnMut(&Progress),
 ) -> io::Result<ScanOutcome> {
+    scan_filtered(root, cancel, on_progress, None)
+}
+
+/// 与 [`scan`] 相同，但 `filter` 返回 `Some` 的目录会被整个跳过（不进入、不统计），并记录在 `excluded` 里。
+pub fn scan_filtered(
+    root: &Path,
+    cancel: &AtomicBool,
+    on_progress: &mut dyn FnMut(&Progress),
+    filter: Option<DirFilter>,
+) -> io::Result<ScanOutcome> {
     let meta = fs::symlink_metadata(root)?;
     if !meta.is_dir() || special_reason(&meta).is_some() {
         return Err(io::Error::new(
@@ -119,6 +138,8 @@ pub fn scan(
         ));
     }
     let mut ctx = Ctx {
+        filter,
+        excluded: Vec::new(),
         cancel,
         on_progress,
         progress: Progress::default(),
@@ -134,6 +155,7 @@ pub fn scan(
     Ok(ScanOutcome {
         root: node,
         skipped: ctx.skipped,
+        excluded: ctx.excluded,
         cancelled: cancel.load(Ordering::Relaxed),
     })
 }
@@ -189,6 +211,16 @@ fn walk(path: &Path, name: String, depth: usize, ctx: &mut Ctx) -> Node {
             continue;
         }
         let child_name = entry.file_name().to_string_lossy().into_owned();
+        if meta.is_dir() {
+            if let Some(reason) = ctx.filter.and_then(|f| f(&child_path)) {
+                ctx.excluded.push(Excluded {
+                    path: child_path,
+                    reason,
+                    size: 0,
+                });
+                continue;
+            }
+        }
         ctx.tick();
         if meta.is_dir() {
             let child = walk(&child_path, child_name, depth + 1, ctx);
@@ -241,6 +273,41 @@ fn collect(path: &Path, node: &Node, n: usize, heap: &mut BinaryHeap<Reverse<(u6
             heap.push(Reverse((child.size, p)));
         }
     }
+}
+
+/// 事后剪掉被排除的目录（用于 MFT 扫描：它一次读出整个卷，没有"遍历时跳过"的机会）。
+/// 被剪掉的目录的大小会从所有上级扣除，并记录在返回值里。
+pub fn prune_excluded(root: &mut Node, root_path: &Path, filter: DirFilter) -> Vec<Excluded> {
+    fn walk(node: &mut Node, path: &Path, filter: DirFilter, out: &mut Vec<Excluded>) {
+        let mut removed = (0u64, 0u64);
+        let mut keep = Vec::with_capacity(node.children.len());
+        for mut child in std::mem::take(&mut node.children) {
+            let cp = path.join(&child.name);
+            if child.is_dir {
+                if let Some(reason) = filter(&cp) {
+                    removed.0 += child.size;
+                    removed.1 += child.file_count;
+                    out.push(Excluded {
+                        path: cp,
+                        reason,
+                        size: child.size,
+                    });
+                    continue;
+                }
+                let before = (child.size, child.file_count);
+                walk(&mut child, &cp, filter, out);
+                removed.0 += before.0 - child.size;
+                removed.1 += before.1 - child.file_count;
+            }
+            keep.push(child);
+        }
+        node.children = keep;
+        node.size = node.size.saturating_sub(removed.0);
+        node.file_count = node.file_count.saturating_sub(removed.1);
+    }
+    let mut out = Vec::new();
+    walk(root, root_path, filter, &mut out);
+    out
 }
 
 // ---------- 就地更新扫描树 ----------
@@ -568,5 +635,102 @@ mod tests {
             "中间目录不存在时失败"
         );
         assert_eq!(t.size, 450);
+    }
+
+    // ----- 排除目录 -----
+
+    fn cloud_filter(p: &Path) -> Option<String> {
+        crate::cloud::provider_of_name(&p.file_name()?.to_string_lossy()).map(str::to_string)
+    }
+
+    #[test]
+    fn filtered_scan_skips_excluded_directories_entirely() {
+        let d = tmpdir();
+        write(&d.join("real/a.bin"), 100);
+        write(&d.join("Google Drive/huge.bin"), 9_999);
+        write(&d.join("real/OneDrive - Work/doc.bin"), 777);
+        write(&d.join("real/keep/b.bin"), 5);
+        let out = scan_filtered(
+            &d,
+            &AtomicBool::new(false),
+            &mut |_| {},
+            Some(&cloud_filter),
+        )
+        .unwrap();
+        assert_eq!(out.root.size, 105, "云目录里的内容不能计入");
+        assert_eq!(
+            out.root
+                .children
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["real"]
+        );
+        let mut ex: Vec<_> = out
+            .excluded
+            .iter()
+            .map(|e| {
+                (
+                    e.path.file_name().unwrap().to_string_lossy().into_owned(),
+                    e.reason.clone(),
+                )
+            })
+            .collect();
+        ex.sort();
+        assert_eq!(
+            ex,
+            [
+                ("Google Drive".into(), "Google Drive".into()),
+                ("OneDrive - Work".into(), "OneDrive".into())
+            ]
+        );
+        // 不带过滤器时行为与之前完全一致。
+        let all = scan(&d, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        assert_eq!(all.root.size, 105 + 9_999 + 777);
+        assert!(all.excluded.is_empty());
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn pruning_a_finished_tree_matches_a_filtered_scan() {
+        let d = tmpdir();
+        write(&d.join("real/a.bin"), 100);
+        write(&d.join("Dropbox/x/huge.bin"), 5_000);
+        write(&d.join("real/Dropbox (Personal)/y.bin"), 300);
+        write(&d.join("other.bin"), 7);
+        let mut tree = scan(&d, &AtomicBool::new(false), &mut |_| {}).unwrap().root;
+        let pruned = prune_excluded(&mut tree, &d, &cloud_filter);
+        let filtered = scan_filtered(
+            &d,
+            &AtomicBool::new(false),
+            &mut |_| {},
+            Some(&cloud_filter),
+        )
+        .unwrap();
+        assert_eq!(
+            (tree.size, tree.file_count),
+            (filtered.root.size, filtered.root.file_count)
+        );
+        assert_eq!(tree.size, 107);
+        let real = tree.children.iter().find(|c| c.name == "real").unwrap();
+        assert_eq!(
+            (real.size, real.file_count),
+            (100, 1),
+            "上级目录的大小一起扣除"
+        );
+        let mut sizes: Vec<u64> = pruned.iter().map(|e| e.size).collect();
+        sizes.sort();
+        assert_eq!(sizes, [300, 5_000], "记录下被排除目录原来的大小");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn pruning_with_nothing_to_exclude_changes_nothing() {
+        let d = tmpdir();
+        write(&d.join("a/b.bin"), 10);
+        let mut tree = scan(&d, &AtomicBool::new(false), &mut |_| {}).unwrap().root;
+        assert!(prune_excluded(&mut tree, &d, &cloud_filter).is_empty());
+        assert_eq!(tree.size, 10);
+        fs::remove_dir_all(&d).unwrap();
     }
 }

@@ -13,7 +13,7 @@ use std::time::UNIX_EPOCH;
 
 use same_file::Handle;
 
-use crate::scanner::special_reason;
+use crate::scanner::{special_reason, DirFilter, Excluded};
 
 const MAX_DEPTH: usize = 256;
 const READ_BUF: usize = 1 << 20;
@@ -90,6 +90,8 @@ pub struct DupOutcome {
     /// 按可释放空间从大到小排列。
     pub groups: Vec<DupGroup>,
     pub scanned_files: u64,
+    /// 因为是云端/同步目录或用户自定义跳过而没有检查的目录。
+    pub excluded: Vec<Excluded>,
     /// 读取失败而被放弃的文件数。
     pub errors: u64,
     pub cancelled: bool,
@@ -113,6 +115,18 @@ pub fn find_duplicates(
     opts: &DupOptions,
     cancel: &AtomicBool,
     on_progress: &mut dyn FnMut(DupProgress),
+) -> io::Result<DupOutcome> {
+    find_duplicates_filtered(root, opts, cancel, on_progress, None)
+}
+
+/// 与 [`find_duplicates`] 相同，但 `filter` 返回 `Some` 的目录整个跳过。
+/// 云盘里的"仅在线"文件读取会触发下载，同步副本也不应被当成"可删除的重复"。
+pub fn find_duplicates_filtered(
+    root: &Path,
+    opts: &DupOptions,
+    cancel: &AtomicBool,
+    on_progress: &mut dyn FnMut(DupProgress),
+    filter: Option<DirFilter>,
 ) -> io::Result<DupOutcome> {
     let meta = fs::symlink_metadata(root)?;
     if !meta.is_dir() || special_reason(&meta).is_some() {
@@ -146,6 +160,14 @@ pub fn find_duplicates(
                 continue;
             }
             if m.is_dir() {
+                if let Some(reason) = filter.and_then(|f| f(&e.path())) {
+                    out.excluded.push(Excluded {
+                        path: e.path(),
+                        reason,
+                        size: 0,
+                    });
+                    continue;
+                }
                 if depth < MAX_DEPTH {
                     stack.push((e.path(), depth + 1));
                 }
@@ -518,5 +540,29 @@ mod tests {
         assert!(phases.contains(&DupPhase::Walking));
         assert!(phases.contains(&DupPhase::PartialHash));
         assert!(phases.contains(&DupPhase::FullHash));
+    }
+
+    #[test]
+    fn excluded_directories_are_not_searched() {
+        let sb = Sandbox::new();
+        sb.write("local/a.bin", &[7u8; 5000]);
+        sb.write("Google Drive/copy.bin", &[7u8; 5000]);
+        sb.write("OneDrive - Work/copy2.bin", &[7u8; 5000]);
+        let filter = |p: &Path| {
+            crate::cloud::provider_of_name(&p.file_name()?.to_string_lossy()).map(str::to_string)
+        };
+        let out = find_duplicates_filtered(
+            &sb.0,
+            &opts(1),
+            &AtomicBool::new(false),
+            &mut |_| {},
+            Some(&filter),
+        )
+        .unwrap();
+        assert!(out.groups.is_empty(), "云盘里的副本不能被当作重复文件");
+        assert_eq!(out.excluded.len(), 2);
+        assert_eq!(out.scanned_files, 1);
+        // 不带过滤器时三份都会被找到。
+        assert_eq!(run(&sb, &opts(1)).groups[0].files.len(), 3);
     }
 }

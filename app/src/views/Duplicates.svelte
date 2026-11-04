@@ -158,6 +158,7 @@
 
 {#if summary && !scanning}
   {#if summary.cancelled}<div class="note">{t('dup.cancelledNote')}</div>{/if}
+  {#if summary.excluded.length > 0}<p class="muted small">{t('cloud.excluded', { n: summary.excluded.length })}</p>{/if}
   {#if summary.groups.length === 0}
     <p class="muted empty">{t('dup.none')}</p>
   {:else}

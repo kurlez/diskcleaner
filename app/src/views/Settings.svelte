@@ -4,13 +4,19 @@
   import { errorText, i18n, setLocale, t } from '../lib/i18n.svelte';
 
   let exclusions = $state<string[]>([]);
+  let analyzeCloud = $state(false);
+  let skipPaths = $state<string[]>([]);
+  let skipDraft = $state('');
   let draft = $state('');
   let error = $state('');
   let busy = $state(false);
 
   onMount(async () => {
     try {
-      exclusions = (await api.settingsGet()).exclusions;
+      const s = await api.settingsGet();
+      exclusions = s.exclusions;
+      analyzeCloud = s.analyze_cloud;
+      skipPaths = s.skip_paths;
     } catch (e) {
       error = errorText(e);
     }
@@ -28,6 +34,28 @@
     } finally {
       busy = false;
     }
+  }
+
+  async function saveCloud(analyze: boolean, paths: string[]) {
+    busy = true;
+    error = '';
+    try {
+      const s = await api.settingsSetCloud(analyze, paths);
+      analyzeCloud = s.analyze_cloud;
+      skipPaths = s.skip_paths;
+      return true;
+    } catch (e) {
+      error = errorText(e);
+      return false;
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function addSkip() {
+    const p = skipDraft.trim();
+    if (!p || skipPaths.includes(p)) return;
+    if (await saveCloud(analyzeCloud, [...skipPaths, p])) skipDraft = '';
   }
 
   async function add() {
@@ -69,6 +97,34 @@
   {/if}
 </div>
 
+<div class="card block">
+  <h2>{t('settings.cloudTitle')}</h2>
+  <p class="muted hint">{t('settings.cloudDesc')}</p>
+  <label class="opt"><input type="checkbox" checked={analyzeCloud} disabled={busy} onchange={async (e) => {
+    const box = e.currentTarget;
+    const v = box.checked;
+    if (!(await saveCloud(v, skipPaths))) box.checked = !v; // 保存失败：复选框回到原状态
+  }} />{t('settings.analyzeCloud')}</label>
+  <h3 class="sub">{t('settings.skipTitle')}</h3>
+  <p class="muted hint">{t('settings.skipHint')}</p>
+  <form class="row" onsubmit={(e) => { e.preventDefault(); addSkip(); }}>
+    <input type="text" class="grow" bind:value={skipDraft} placeholder={t('settings.skipPlaceholder')} spellcheck="false" aria-label={t('settings.skipTitle')} />
+    <button type="submit" class="primary" disabled={busy || !skipDraft.trim()}>{t('settings.add')}</button>
+  </form>
+  {#if skipPaths.length === 0}
+    <p class="muted">{t('settings.skipEmpty')}</p>
+  {:else}
+    <ul>
+      {#each skipPaths as p (p)}
+        <li class="row">
+          <span class="mono grow ellipsis" title={p}>{p}</span>
+          <button class="link" disabled={busy} onclick={() => saveCloud(analyzeCloud, skipPaths.filter((x) => x !== p))}>{t('settings.remove')}</button>
+        </li>
+      {/each}
+    </ul>
+  {/if}
+</div>
+
 <p class="muted about">{t('settings.about')}</p>
 
 <style>
@@ -77,4 +133,6 @@
   ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
   li { padding: 4px 0; border-bottom: 1px solid var(--border); }
   .about { margin-top: 20px; font-size: 12.5px; }
+  .opt { display: flex; gap: 10px; align-items: center; font-weight: 600; }
+  .sub { margin: 8px 0 0; font-size: 13px; color: var(--muted); }
 </style>

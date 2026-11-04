@@ -116,6 +116,17 @@
   </div>
   {#if summary.fallback}<div class="note">{t(`scan.fallback.${summary.fallback}`)}</div>{/if}
   {#if summary.cancelled}<div class="note">{t('scan.cancelledNote')}</div>{/if}
+  {#if summary.excluded.length > 0}
+    <details class="note excl">
+      <summary>{t('cloud.excluded', { n: summary.excluded.length })}</summary>
+      <p class="small">{t('cloud.excludedHint')}</p>
+      <ul>
+        {#each summary.excluded as e}
+          <li><span class="mono small">{e.path}</span> <span class="badge">{e.reason === 'custom' ? t('cloud.reason.custom') : e.reason}</span>{#if e.size > 0} <span class="muted small num">{formatSize(e.size)}</span>{/if}</li>
+        {/each}
+      </ul>
+    </details>
+  {/if}
   {#if summary.skipped > 0}<p class="muted small">{t('scan.skipped', { n: summary.skipped.toLocaleString() })}</p>{/if}
 
   {#if view === 'map'}
@@ -155,6 +166,9 @@
   .status { display: flex; flex-direction: column; gap: 6px; }
   .summary { margin: 8px 0; gap: 14px; }
   .big { font-size: 20px; }
+  .excl { margin-top: 8px; }
+  .excl summary { cursor: pointer; }
+  .excl ul { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
   .method.mft { background: var(--accent-soft); color: var(--accent); }
   .note { margin-top: 8px; }
   .cols[hidden] { display: none; }

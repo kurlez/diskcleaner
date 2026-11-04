@@ -17,7 +17,7 @@ const LEFTOVER_REASONS = [
   'auto_run', 'stale_service', 'com_registration', 'shortcut',
 ];
 const MIG_ISSUES = [
-  'invalid_path', 'source_missing', 'source_not_dir', 'source_is_link', 'already_migrated',
+  'invalid_path', 'source_missing', 'source_not_dir', 'source_is_link', 'already_migrated', 'cloud_location',
   'source_protected', 'target_protected', 'target_inside_source', 'source_inside_target',
   'migration_in_progress', 'same_volume', 'target_remote', 'target_removable',
   'source_fs_unsupported', 'volume_unknown', 'target_exists_nonempty', 'contains_links',
@@ -36,7 +36,7 @@ const ERROR_CODES = [
   'unknown_action', 'sys_failed', 'unknown_app', 'no_uninstaller', 'invalid_command',
   'uninstall_failed', 'backup_failed', 'mig_preflight', 'mig_copy_failed', 'mig_verify_failed',
   'mig_in_use', 'mig_link_failed', 'mig_manifest', 'mig_not_restorable', 'unknown_migration',
-  'no_blockers', 'cancelled',
+  'no_blockers', 'cancelled', 'cloud_location', 'invalid_skip_path',
 ];
 
 describe('locales', () => {

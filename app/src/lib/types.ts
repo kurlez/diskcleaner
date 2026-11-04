@@ -3,10 +3,11 @@
 export type Risk = 'low' | 'medium' | 'high';
 export type Disposal = 'recycle' | 'permanent';
 
-export interface Drive { mount: string; name: string; fs: string; total: number; free: number }
+export interface Drive { mount: string; name: string; fs: string; total: number; free: number; cloud: string | null }
+export interface Excluded { path: string; reason: string; size: number }
 export interface FileEntry { path: string; size: number }
 export interface ScanSummary {
-  method: 'mft' | 'walk'; fallback: string | null;
+  method: 'mft' | 'walk'; fallback: string | null; excluded: Excluded[];
   root: string; total_size: number; file_count: number; skipped: number;
   cancelled: boolean; top_files: FileEntry[];
 }
@@ -28,13 +29,13 @@ export interface Report {
 }
 export interface ScanProgress { files: number; dirs: number; bytes: number }
 export interface CleanProgress { done: number; total: number }
-export interface Settings { exclusions: string[] }
+export interface Settings { exclusions: string[]; analyze_cloud: boolean; skip_paths: string[] }
 
 export interface DupFile { path: string; modified: number }
 export interface DupGroup { id: number; size: number; wasted: number; keep: number; files: DupFile[] }
 export interface DupSummary {
   groups: DupGroup[]; hidden_groups: number; total_wasted: number;
-  scanned_files: number; errors: number; cancelled: boolean;
+  scanned_files: number; errors: number; excluded: Excluded[]; cancelled: boolean;
 }
 export interface DupProgress { phase: 'walking' | 'partial' | 'full'; done: number; total: number }
 export interface DupSelection { group: number; file: number; path?: string }
@@ -96,6 +97,7 @@ export interface Api {
   cleanCancel(): Promise<void>;
   settingsGet(): Promise<Settings>;
   settingsSetExclusions(exclusions: string[]): Promise<Settings>;
+  settingsSetCloud(analyzeCloud: boolean, skipPaths: string[]): Promise<Settings>;
   dupScan(path: string, minSizeMb: number): Promise<DupSummary>;
   dupCancel(): Promise<void>;
   dupCurrent(): Promise<DupSummary>;

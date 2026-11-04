@@ -235,6 +235,7 @@ export const zh: Record<string, string> = {
   'mig.howTitle': '迁移过程',
   'mig.how': '先复制并逐项校验，再把原目录改名、建立 junction、验证可用，最后才删除旧目录。任何一步失败都会回滚，原目录始终完好。',
 
+  'mig.issue.cloud_location': '这是云同步目录（{detail}），迁移会破坏同步，不能迁移。',
   'mig.issue.invalid_path': '路径无效：需要是带盘符的完整路径，且不能含 " % ^ & | < > 等字符。',
   'mig.issue.source_missing': '要迁移的目录不存在。',
   'mig.issue.source_not_dir': '要迁移的不是文件夹。',
@@ -323,6 +324,19 @@ export const zh: Record<string, string> = {
   'un.migrate': '迁移到其他盘',
 
   'top.copy': '复制完整路径',
+
+  'cloud.excluded': '已排除 {n} 个云端或同步目录，不参与分析',
+  'cloud.excludedHint': '云盘里的内容多数不占本机空间，混进来会误导。可以在“设置”里改成分析云端。',
+  'cloud.reason.custom': '自定义跳过',
+  'cloud.hiddenDrives': '已隐藏 {n} 个云端或网络驱动器：{names}',
+  'cloud.network': '网络驱动器',
+  'settings.cloudTitle': '云端硬盘与同步目录',
+  'settings.cloudDesc': '默认不分析 Google Drive、OneDrive、Dropbox、iCloud、坚果云、百度网盘、群晖 Drive 等云端或同步目录，也不分析网络驱动器。',
+  'settings.analyzeCloud': '也分析云端硬盘和同步目录',
+  'settings.skipTitle': '额外跳过的路径',
+  'settings.skipHint': '这些文件夹不参与分析（无论是否分析云端）。需要是带盘符的完整路径。',
+  'settings.skipPlaceholder': '例如 D:\\Games',
+  'settings.skipEmpty': '还没有额外跳过的路径。',
 
   'clean.title': '智能清理',
   'clean.subtitle': '只清理可再生的临时数据。先预览，确认后才会删除。',
@@ -437,5 +451,7 @@ export const zh: Record<string, string> = {
   'err.unknown_migration': '找不到这条迁移记录。',
   'err.no_blockers': '请先检测占用，再停止进程。',
   'err.cancelled': '已取消。',
+  'err.cloud_location': '这个位置是云端硬盘或同步目录（{detail}），不参与分析。可以在“设置”里改成分析云端。',
+  'err.invalid_skip_path': '跳过路径无效，需要是形如 D:\\folder 的完整路径。',
   'err.unknown': '发生未知错误。',
 };

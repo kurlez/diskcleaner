@@ -39,6 +39,7 @@ const TOP_FILES_ALL = [
 function buildSummary(cancelled: boolean) {
   return {
     method: 'mft' as const, fallback: null,
+    excluded: [{ path: 'C:\\Users\\alice\\OneDrive - Work', reason: 'OneDrive', size: 18 * GB }, { path: 'C:\\Users\\alice\\Dropbox', reason: 'Dropbox', size: 6 * GB }],
     root: mockRoot, total_size: mockTotal, file_count: 852_000, skipped: 37, cancelled,
     top_files: TOP_FILES_ALL.filter((f) => !removedPaths.has(f.path)),
   };
@@ -62,6 +63,8 @@ function removeFromMock(parts: string[]) {
 }
 
 let exclusions: string[] = ['D:\\Projects\\keep'];
+let analyzeCloud = false;
+let skipPaths: string[] = ['D:\\Games'];
 let cancelScan = false;
 let mockTotal = 312 * GB;
 let mockRoot = 'C:\\';
@@ -118,7 +121,7 @@ let dupGroups: DupGroup[] = [
     { path: 'D:\\Docs\\archive\\report-final.pdf', modified: t0 + 100 },
     { path: 'D:\\Desktop\\report.pdf', modified: t0 + 200 } ] },
 ];
-const dupSummary = (): DupSummary => ({ groups: dupGroups, hidden_groups: 0, total_wasted: dupGroups.reduce((a, g) => a + g.wasted, 0), scanned_files: 48_213, errors: 2, cancelled: false });
+const dupSummary = (): DupSummary => ({ groups: dupGroups, hidden_groups: 0, total_wasted: dupGroups.reduce((a, g) => a + g.wasted, 0), scanned_files: 48_213, errors: 2, excluded: [{ path: 'D:\\Google Drive', reason: 'Google Drive', size: 0 }], cancelled: false });
 
 const rules: Rule[] = [
   ['user_temp', 'low', true], ['system_temp', 'low', true], ['thumbnail_cache', 'low', true],
@@ -130,8 +133,9 @@ export const mockApi: Api = {
   async listDrives() {
     await sleep(150);
     return [
-      { mount: 'C:\\', name: 'Windows', fs: 'NTFS', total: 476 * GB, free: 38 * GB },
-      { mount: 'D:\\', name: 'Data', fs: 'NTFS', total: 931 * GB, free: 612 * GB },
+      { mount: 'C:\\', name: 'Windows', fs: 'NTFS', total: 476 * GB, free: 38 * GB, cloud: null },
+      { mount: 'D:\\', name: 'Data', fs: 'NTFS', total: 931 * GB, free: 612 * GB, cloud: null },
+      { mount: 'G:\\', name: 'Google Drive', fs: 'NTFS', total: 2048 * GB, free: 1500 * GB, cloud: 'Google Drive' },
     ];
   },
   async scanStart(path) {
@@ -195,11 +199,17 @@ export const mockApi: Api = {
     return rep;
   },
   async cleanCancel() { cancelClean = true; },
-  async settingsGet(): Promise<Settings> { return { exclusions }; },
+  async settingsGet(): Promise<Settings> { return { exclusions, analyze_cloud: analyzeCloud, skip_paths: skipPaths }; },
+  async settingsSetCloud(analyze, paths) {
+    if (paths.some((p) => !/^[A-Za-z]:\\/.test(p))) throw { code: 'invalid_skip_path', detail: paths.find((p) => !/^[A-Za-z]:\\/.test(p)) };
+    analyzeCloud = analyze;
+    skipPaths = paths;
+    return { exclusions, analyze_cloud: analyzeCloud, skip_paths: skipPaths };
+  },
   async settingsSetExclusions(list) {
     if (list.some((p) => !/^[A-Za-z]:\\/.test(p))) throw { code: 'invalid_exclusion', detail: list.find((p) => !/^[A-Za-z]:\\/.test(p)) };
     exclusions = list;
-    return { exclusions };
+    return { exclusions, analyze_cloud: analyzeCloud, skip_paths: skipPaths };
   },
   async dupScan() {
     cancelDup = false;

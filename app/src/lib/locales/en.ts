@@ -235,6 +235,7 @@ export const en: Record<string, string> = {
   'mig.howTitle': 'How it works',
   'mig.how': 'Files are copied and verified one by one first. Only then is the original folder renamed, a junction created and tested, and the old folder deleted. Any failure rolls everything back and the original stays intact.',
 
+  'mig.issue.cloud_location': 'This is a cloud sync folder ({detail}). Moving it would break syncing, so it cannot be moved.',
   'mig.issue.invalid_path': 'Invalid path: use a full path with a drive letter, without characters such as " % ^ & | < >.',
   'mig.issue.source_missing': 'The folder to move does not exist.',
   'mig.issue.source_not_dir': 'That is not a folder.',
@@ -323,6 +324,19 @@ export const en: Record<string, string> = {
   'un.migrate': 'Move to another drive',
 
   'top.copy': 'Copy full path',
+
+  'cloud.excluded': '{n} cloud or sync folders were left out of the analysis',
+  'cloud.excludedHint': 'Most cloud content does not use local space, so mixing it in would mislead. You can change this in Settings.',
+  'cloud.reason.custom': 'Custom skip',
+  'cloud.hiddenDrives': '{n} cloud or network drives hidden: {names}',
+  'cloud.network': 'Network drive',
+  'settings.cloudTitle': 'Cloud drives and sync folders',
+  'settings.cloudDesc': 'Google Drive, OneDrive, Dropbox, iCloud, Nutstore, Baidu Netdisk, Synology Drive and similar cloud or sync folders, as well as network drives, are not analyzed by default.',
+  'settings.analyzeCloud': 'Also analyze cloud drives and sync folders',
+  'settings.skipTitle': 'Extra paths to skip',
+  'settings.skipHint': 'These folders are left out of the analysis (whether or not cloud analysis is on). Use a full path with a drive letter.',
+  'settings.skipPlaceholder': 'e.g. D:\\Games',
+  'settings.skipEmpty': 'No extra paths are skipped yet.',
 
   'clean.title': 'Smart clean',
   'clean.subtitle': 'Only regenerable temporary data is cleaned. You preview first; nothing is deleted until you confirm.',
@@ -437,5 +451,7 @@ export const en: Record<string, string> = {
   'err.unknown_migration': 'That move record was not found.',
   'err.no_blockers': 'Detect what is using the folder before stopping processes.',
   'err.cancelled': 'Cancelled.',
+  'err.cloud_location': 'This location is a cloud drive or sync folder ({detail}) and is not analyzed. You can change this in Settings.',
+  'err.invalid_skip_path': 'Invalid path to skip. Use a full path such as D:\\folder.',
   'err.unknown': 'An unknown error occurred.',
 };

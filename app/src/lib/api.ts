@@ -18,6 +18,7 @@ const real: Api = {
   cleanCancel: () => invoke('clean_cancel'),
   settingsGet: () => invoke('settings_get'),
   settingsSetExclusions: (exclusions) => invoke('settings_set_exclusions', { exclusions }),
+  settingsSetCloud: (analyzeCloud, skipPaths) => invoke('settings_set_cloud', { analyzeCloud, skipPaths }),
   dupScan: (path, minSizeMb) => invoke('dup_scan', { path, minSizeMb }),
   dupCancel: () => invoke('dup_cancel'),
   dupCurrent: () => invoke('dup_current'),

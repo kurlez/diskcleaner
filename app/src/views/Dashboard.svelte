@@ -30,6 +30,10 @@
     }
   });
 
+  const local = $derived((drives ?? []).filter((d) => !d.cloud));
+  const hidden = $derived((drives ?? []).filter((d) => d.cloud));
+  const cloudName = (d: Drive) => (d.cloud === 'Network' ? t('cloud.network') : d.cloud);
+
   const used = (d: Drive) => d.total - d.free;
   const level = (d: Drive) => (percent(used(d), d.total) >= 90 ? 'danger' : percent(used(d), d.total) >= 80 ? 'warn' : '');
 </script>
@@ -41,11 +45,11 @@
   <div class="error" role="alert">{error} <button class="link" onclick={load}>{t('common.retry')}</button></div>
 {:else if drives === null}
   <p class="muted">{t('common.loading')}</p>
-{:else if drives.length === 0}
+{:else if local.length === 0 && hidden.length === 0}
   <p class="muted">{t('dash.empty')}</p>
 {:else}
   <div class="grid">
-    {#each drives as d (d.mount)}
+    {#each local as d (d.mount)}
       <article class="card">
         <div class="row head">
           <strong class="mount">{d.mount}</strong>
@@ -66,6 +70,9 @@
       </article>
     {/each}
   </div>
+  {#if hidden.length}
+    <p class="muted small hid">{t('cloud.hiddenDrives', { n: hidden.length, names: hidden.map((d) => `${d.mount} ${cloudName(d)}`).join('、') })}</p>
+  {/if}
 {/if}
 
 <style>
@@ -75,4 +82,5 @@
   .mount { font-size: 18px; }
   .meta { font-size: 13px; }
   .actions { margin-top: 4px; }
+  .hid { margin-top: 14px; font-size: 12.5px; }
 </style>

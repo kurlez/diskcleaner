@@ -35,6 +35,8 @@ use crate::uninstall::format_timestamp;
 pub struct VolumeInfo {
     /// 卷的挂载点（如 `C:\`）。两个路径的挂载点相同就是同一个卷。
     pub mount: PathBuf,
+    /// 卷标（如 `Data`、`Google Drive`）。
+    pub label: String,
     pub fs: String,
     pub free: u64,
     pub total: u64,
@@ -75,6 +77,7 @@ impl Volumes for SysVolumes {
                     len,
                     VolumeInfo {
                         mount: mount.to_path_buf(),
+                        label: d.name().to_string_lossy().into_owned(),
                         fs: d.file_system().to_string_lossy().into_owned(),
                         free: d.available_space(),
                         total: d.total_space(),
@@ -593,6 +596,8 @@ impl Preflight {
 pub struct PreflightOptions {
     /// 程序安装根目录（`Program Files` 等）。迁移其中的程序时给出提示。
     pub program_dirs: Vec<PathBuf>,
+    /// 云同步目录的识别规则。云同步目录不能迁移：搬走会破坏同步。
+    pub cloud: crate::cloud::CloudRules,
 }
 
 #[derive(Debug, Default)]
@@ -691,6 +696,9 @@ pub fn preflight(
     }
     if let Err(d) = policy.check_delete(&src.to_string_lossy()) {
         p.issues.push(Issue::err("source_protected", d.to_string()));
+    }
+    if let Some(provider) = opts.cloud.location_excluded(src) {
+        p.issues.push(Issue::err("cloud_location", provider));
     }
     if let Err(d) = policy.check_delete(&dst.to_string_lossy()) {
         p.issues.push(Issue::err("target_protected", d.to_string()));
@@ -1411,6 +1419,7 @@ mod tests {
         fn volume_of(&self, path: &Path) -> Option<VolumeInfo> {
             let mk = |mount: &Path, fs: &str, free, removable, remote| VolumeInfo {
                 mount: mount.to_path_buf(),
+                label: String::new(),
                 fs: fs.into(),
                 free,
                 total: free * 2,
@@ -1769,6 +1778,7 @@ mod tests {
         let (sb, _) = setup();
         let o = PreflightOptions {
             program_dirs: vec![sb.p("C")],
+            ..PreflightOptions::default()
         };
         let p = preflight(
             &sb.p("C/App"),
@@ -2341,6 +2351,45 @@ mod tests {
             recover(&rec_in(&sb, Status::Switching, Some("C/gone")), &env.deps()),
             Recovery::NeedsAttention(_)
         ));
+    }
+
+    #[test]
+    fn cloud_sync_folders_cannot_be_moved() {
+        let (sb, _) = setup();
+        fs::create_dir_all(sb.p("C/Google Drive/Projects")).unwrap();
+        sb.write("C/Google Drive/Projects/a.bin", 10);
+        sb.write("C/OneDrive - Work/b.bin", 10);
+        let vols = FakeVols::new(&sb);
+        for src in [
+            "C/Google Drive",
+            "C/Google Drive/Projects",
+            "C/OneDrive - Work",
+        ] {
+            let p = preflight(
+                &sb.p(src),
+                &sb.p("D/x"),
+                &vols,
+                &sb.policy(),
+                &[],
+                &PreflightOptions::default(),
+            );
+            let issue = p
+                .issues
+                .iter()
+                .find(|i| i.code == "cloud_location")
+                .unwrap_or_else(|| panic!("{src}: {:?}", p.issues));
+            assert!(issue.detail.is_some());
+            assert!(!p.can_proceed());
+        }
+        let normal = preflight(
+            &sb.p("C/App"),
+            &sb.p("D/x"),
+            &vols,
+            &sb.policy(),
+            &[],
+            &PreflightOptions::default(),
+        );
+        assert!(!codes(&normal).contains(&"cloud_location"));
     }
 
     // ----- 安全策略 -----

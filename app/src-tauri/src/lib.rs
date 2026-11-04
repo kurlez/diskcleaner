@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use diskclean_core::builtin::windows_rules;
+use diskclean_core::cloud;
 use diskclean_core::migrate::{self, LinkMaker, MklinkJunction};
 use diskclean_core::procs;
 use diskclean_core::registry::Registry;
@@ -178,6 +179,12 @@ fn real_registry() -> Arc<dyn Registry> {
     Arc::new(diskclean_core::registry::NoRegistry)
 }
 
+/// 由当前设置得到"哪些目录不参与分析"的规则。
+fn cloud_rules(state: &AppState) -> cloud::CloudRules {
+    let s = state.settings.lock().unwrap();
+    cloud::CloudRules::new(s.analyze_cloud, &s.skip_paths, &Env::from_process())
+}
+
 async fn blocking<T, F>(f: F) -> Result<T, ApiError>
 where
     T: Send + 'static,
@@ -200,8 +207,9 @@ async fn scan_start(
     path: String,
 ) -> Result<ScanSummary, ApiError> {
     let svc = state.svc.clone();
+    let rules = cloud_rules(&state);
     blocking(move || {
-        svc.scan(&path, &mut |p| {
+        svc.scan_with(&path, &rules, &mut |p| {
             let _ = app.emit("scan-progress", p);
         })
     })
@@ -295,10 +303,16 @@ async fn dup_scan(
     min_size_mb: u64,
 ) -> Result<DupSummary, ApiError> {
     let svc = state.svc.clone();
+    let rules = cloud_rules(&state);
     blocking(move || {
-        svc.dup_scan(&path, min_size_mb.saturating_mul(1024 * 1024), &mut |p| {
-            let _ = app.emit("dup-progress", p);
-        })
+        svc.dup_scan_with(
+            &path,
+            min_size_mb.saturating_mul(1024 * 1024),
+            &rules,
+            &mut |p| {
+                let _ = app.emit("dup-progress", p);
+            },
+        )
     })
     .await
 }
@@ -496,6 +510,35 @@ fn settings_get(state: State<'_, AppState>) -> Settings {
 }
 
 #[tauri::command]
+fn settings_set_cloud(
+    state: State<'_, AppState>,
+    analyze_cloud: bool,
+    skip_paths: Vec<String>,
+) -> Result<Settings, ApiError> {
+    let skip_paths: Vec<String> = skip_paths
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    // 跳过路径必须是带盘符的完整路径，否则永远匹配不到，静默无效比报错更糟。
+    for p in &skip_paths {
+        if diskclean_core::mft::split_drive_path(p).is_none() {
+            return Err(ApiError::with("invalid_skip_path", p));
+        }
+    }
+    let mut guard = state.settings.lock().unwrap();
+    let next = Settings {
+        analyze_cloud,
+        skip_paths,
+        ..guard.clone()
+    };
+    next.save(&state.settings_path)
+        .map_err(|e| ApiError::with("settings_failed", e))?;
+    *guard = next.clone();
+    Ok(next)
+}
+
+#[tauri::command]
 fn settings_set_exclusions(
     state: State<'_, AppState>,
     exclusions: Vec<String>,
@@ -504,7 +547,10 @@ fn settings_set_exclusions(
         state.svc.validate_exclusion(x)?;
     }
     let mut guard = state.settings.lock().unwrap();
-    let next = Settings { exclusions };
+    let next = Settings {
+        exclusions,
+        ..guard.clone()
+    };
     next.save(&state.settings_path)
         .map_err(|e| ApiError::with("settings_failed", e))?;
     *guard = next.clone();
@@ -582,6 +628,7 @@ pub fn run() {
             mig_restore,
             settings_get,
             settings_set_exclusions,
+            settings_set_cloud,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DiskClean");

@@ -279,6 +279,7 @@ pub fn scan_volume<R: Read + Seek>(
     Ok(ScanOutcome {
         root,
         skipped: Vec::new(),
+        excluded: Vec::new(),
         cancelled,
     })
 }

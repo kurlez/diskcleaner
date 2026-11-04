@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use diskclean_core::cleaner::{execute_with, ExecOptions, Report, Status};
+use diskclean_core::cloud::{self, CloudRules};
 use diskclean_core::duplicates::{self, DupGroup, DupOptions, DupOutcome, DupPhase};
 use diskclean_core::migrate::{
     self, Copier, Deps, DirMover, LinkMaker, ManifestStore, MigrateError, MigrationRecord,
@@ -73,6 +74,16 @@ pub struct DriveDto {
     pub fs: String,
     pub total: u64,
     pub free: u64,
+    /// 云端虚拟盘或网络驱动器的服务名（如 `Google Drive`、`Network`）；普通磁盘为空。
+    pub cloud: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExcludedDto {
+    pub path: String,
+    /// 服务名（如 `OneDrive`）或 `custom`。
+    pub reason: String,
+    pub size: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -91,6 +102,8 @@ pub struct ScanSummary {
     pub total_size: u64,
     pub file_count: u64,
     pub skipped: usize,
+    /// 没有参与分析的云端/同步目录与自定义跳过的目录。
+    pub excluded: Vec<ExcludedDto>,
     pub cancelled: bool,
     pub top_files: Vec<FileDto>,
 }
@@ -202,6 +215,7 @@ pub struct DupSummary {
     pub total_wasted: u64,
     pub scanned_files: u64,
     pub errors: u64,
+    pub excluded: Vec<ExcludedDto>,
     pub cancelled: bool,
 }
 
@@ -464,6 +478,7 @@ struct ScanState {
     method: &'static str,
     fallback: Option<&'static str>,
     skipped: usize,
+    excluded: Vec<scanner::Excluded>,
 }
 
 pub struct Service {
@@ -573,6 +588,13 @@ impl Service {
                 fs: d.file_system().to_string_lossy().into_owned(),
                 total: d.total_space(),
                 free: d.available_space(),
+                cloud: cloud::provider_of_label(&d.name().to_string_lossy())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        self.mig.as_ref().and_then(|m| {
+                            cloud::drive_provider(m.parts.volumes.as_ref(), d.mount_point())
+                        })
+                    }),
             })
             .collect();
         v.sort_by(|a, b| a.mount.cmp(&b.mount));
@@ -581,16 +603,50 @@ impl Service {
 
     // ----- 扫描 -----
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    /// 默认规则（排除云端/同步目录）的扫描。
     pub fn scan(
         &self,
         path: &str,
+        on_progress: &mut dyn FnMut(ProgressDto),
+    ) -> Result<ScanSummary> {
+        self.scan_with(path, &self.default_cloud_rules(), on_progress)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    /// 没有设置时的默认规则：排除云端/同步目录，不跳过任何自定义路径。
+    pub fn default_cloud_rules(&self) -> CloudRules {
+        CloudRules::new(false, &[], &self.env)
+    }
+
+    /// 路径所在的位置是否应当排除（云端虚拟盘、网络驱动器，或位于云同步/自定义跳过的目录里）。
+    fn excluded_location(&self, path: &Path, rules: &CloudRules) -> Option<String> {
+        if let Some(r) = rules.location_excluded(path) {
+            return Some(r);
+        }
+        // 云盘/网络驱动器整盘排除；设置里选择"分析云端"时才放开（自定义跳过路径仍然生效，上面已处理）。
+        let m = self.mig.as_ref()?;
+        if !rules_allow_cloud(rules) {
+            return cloud::drive_provider(m.parts.volumes.as_ref(), path);
+        }
+        None
+    }
+
+    pub fn scan_with(
+        &self,
+        path: &str,
+        rules: &CloudRules,
         on_progress: &mut dyn FnMut(ProgressDto),
     ) -> Result<ScanSummary> {
         let root_path = PathBuf::from(path);
         if path.trim().is_empty() || !root_path.is_dir() {
             return Err(ApiError::with("invalid_path", path));
         }
+        if let Some(provider) = self.excluded_location(&root_path, rules) {
+            return Err(ApiError::with("cloud_location", provider));
+        }
         self.scan_cancel.store(false, Ordering::Relaxed);
+        let filter = |p: &Path| rules.excluded_dir(p);
 
         let mut method = "walk";
         let mut fallback = None;
@@ -603,8 +659,10 @@ impl Service {
                     bytes: p.bytes,
                 });
             }) {
-                Ok(out) => {
+                Ok(mut out) => {
                     method = "mft";
+                    // MFT 一次读出整个卷，没有"遍历时跳过"的机会：事后把被排除的目录剪掉。
+                    out.excluded = scanner::prune_excluded(&mut out.root, &root_path, &filter);
                     fast = Some(out);
                 }
                 Err((code, _detail)) => fallback = Some(code),
@@ -612,13 +670,18 @@ impl Service {
         }
         let out = match fast {
             Some(out) => out,
-            None => scanner::scan(&root_path, &self.scan_cancel, &mut |p: &Progress| {
-                on_progress(ProgressDto {
-                    files: p.files,
-                    dirs: p.dirs,
-                    bytes: p.bytes,
-                });
-            })
+            None => scanner::scan_filtered(
+                &root_path,
+                &self.scan_cancel,
+                &mut |p: &Progress| {
+                    on_progress(ProgressDto {
+                        files: p.files,
+                        dirs: p.dirs,
+                        bytes: p.bytes,
+                    });
+                },
+                Some(&filter),
+            )
             .map_err(|e| ApiError::with("scan_failed", e))?,
         };
 
@@ -628,6 +691,7 @@ impl Service {
             method,
             fallback,
             skipped: out.skipped.len(),
+            excluded: out.excluded,
         };
         let summary = summarize(&state, out.cancelled);
         *self.scan.lock().unwrap() = Some(state);
@@ -846,32 +910,52 @@ impl Service {
 
     // ----- 重复文件 -----
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn dup_scan(
         &self,
         path: &str,
         min_size: u64,
         on_progress: &mut dyn FnMut(DupProgressDto),
     ) -> Result<DupSummary> {
+        self.dup_scan_with(path, min_size, &self.default_cloud_rules(), on_progress)
+    }
+
+    pub fn dup_scan_with(
+        &self,
+        path: &str,
+        min_size: u64,
+        rules: &CloudRules,
+        on_progress: &mut dyn FnMut(DupProgressDto),
+    ) -> Result<DupSummary> {
         let root = PathBuf::from(path);
         if path.trim().is_empty() || !root.is_dir() {
             return Err(ApiError::with("invalid_path", path));
+        }
+        if let Some(provider) = self.excluded_location(&root, rules) {
+            return Err(ApiError::with("cloud_location", provider));
         }
         self.dup_cancel.store(false, Ordering::Relaxed);
         let opts = DupOptions {
             min_size,
             ..DupOptions::default()
         };
-        let out = duplicates::find_duplicates(&root, &opts, &self.dup_cancel, &mut |p| {
-            on_progress(DupProgressDto {
-                phase: match p.phase {
-                    DupPhase::Walking => "walking",
-                    DupPhase::PartialHash => "partial",
-                    DupPhase::FullHash => "full",
-                },
-                done: p.done,
-                total: p.total,
-            })
-        })
+        let out = duplicates::find_duplicates_filtered(
+            &root,
+            &opts,
+            &self.dup_cancel,
+            &mut |p| {
+                on_progress(DupProgressDto {
+                    phase: match p.phase {
+                        DupPhase::Walking => "walking",
+                        DupPhase::PartialHash => "partial",
+                        DupPhase::FullHash => "full",
+                    },
+                    done: p.done,
+                    total: p.total,
+                })
+            },
+            Some(&|p: &Path| rules.excluded_dir(p)),
+        )
         .map_err(|e| ApiError::with("scan_failed", e))?;
         let summary = dup_summary(&out);
         *self.dup.lock().unwrap() = Some(out);
@@ -1251,6 +1335,8 @@ impl Service {
         let policy = (m.parts.policy_factory)(exclusions)?;
         let opts = PreflightOptions {
             program_dirs: m.parts.program_dirs.clone(),
+            // 云同步目录不能迁移（搬走会破坏同步），与"是否分析云端"的设置无关。
+            cloud: CloudRules::new(false, &[], &self.env),
         };
         let p = migrate::preflight(
             Path::new(source),
@@ -1368,6 +1454,8 @@ impl Service {
         m.cancel.store(false, Ordering::Relaxed);
         let opts = PreflightOptions {
             program_dirs: m.parts.program_dirs.clone(),
+            // 云同步目录不能迁移（搬走会破坏同步），与"是否分析云端"的设置无关。
+            cloud: CloudRules::new(false, &[], &self.env),
         };
         let mut journal = open_journal(journal_path)?;
         let result = migrate::migrate(
@@ -1701,6 +1789,14 @@ fn leftovers_dto(scan: &LeftoverScan) -> LeftoversDto {
     }
 }
 
+/// 规则是否允许分析云端（设置里打开了“分析云端”）。
+fn rules_allow_cloud(rules: &CloudRules) -> bool {
+    // 探针：云同步目录名在「不分析云端」时一定被排除，打开后则不会。
+    rules
+        .excluded_dir(Path::new("__probe__/Google Drive"))
+        .is_none()
+}
+
 /// 由内存里的扫描树生成摘要（总量、最大文件）。
 fn summarize(state: &ScanState, cancelled: bool) -> ScanSummary {
     let top_files = scanner::top_files(&state.root_path, &state.root, TOP_FILES)
@@ -1717,9 +1813,23 @@ fn summarize(state: &ScanState, cancelled: bool) -> ScanSummary {
         total_size: state.root.size,
         file_count: state.root.file_count,
         skipped: state.skipped,
+        excluded: excluded_dtos(&state.excluded),
         cancelled,
         top_files,
     }
+}
+
+fn excluded_dtos(v: &[scanner::Excluded]) -> Vec<ExcludedDto> {
+    let mut out: Vec<ExcludedDto> = v
+        .iter()
+        .map(|e| ExcludedDto {
+            path: display_path(&e.path),
+            reason: e.reason.clone(),
+            size: e.size,
+        })
+        .collect();
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
 }
 
 /// 报告里真正被删除（或移入回收站）的路径。
@@ -1820,6 +1930,7 @@ fn dup_summary(out: &DupOutcome) -> DupSummary {
         total_wasted: out.groups.iter().map(DupGroup::wasted).sum(),
         scanned_files: out.scanned_files,
         errors: out.errors,
+        excluded: excluded_dtos(&out.excluded),
         cancelled: out.cancelled,
     }
 }
@@ -2030,6 +2141,7 @@ mod tests {
                 children: vec![file("x.bin", 20), file("y.bin", 10)],
             },
             skipped: vec![],
+            excluded: vec![],
             cancelled: false,
         }
     }
@@ -3192,6 +3304,7 @@ mod tests {
         fn volume_of(&self, path: &Path) -> Option<VolumeInfo> {
             let mk = |m: &Path| VolumeInfo {
                 mount: m.to_path_buf(),
+                label: String::new(),
                 fs: "NTFS".into(),
                 free: 1 << 40,
                 total: 1 << 41,
@@ -3886,5 +3999,299 @@ mod tests {
             display_path(Path::new(r"\\?\D:\项目\报告📄.docx")),
             r"D:\项目\报告📄.docx"
         );
+    }
+
+    // ---------- 云端硬盘 / 云同步目录不参与分析 ----------
+
+    /// 卷标可配置的两盘模拟：`C` 是普通盘，`G` 是云端虚拟盘或网络驱动器。
+    struct LabelVolumes {
+        normal: PathBuf,
+        cloud: PathBuf,
+        label: &'static str,
+        remote: bool,
+    }
+    impl Volumes for LabelVolumes {
+        fn volume_of(&self, path: &Path) -> Option<VolumeInfo> {
+            let (mount, label, remote) = if path.starts_with(&self.cloud) {
+                (&self.cloud, self.label, self.remote)
+            } else if path.starts_with(&self.normal) {
+                (&self.normal, "Data", false)
+            } else {
+                return None;
+            };
+            Some(VolumeInfo {
+                mount: mount.clone(),
+                label: label.into(),
+                fs: "NTFS".into(),
+                free: 1 << 40,
+                total: 1 << 41,
+                removable: false,
+                remote,
+            })
+        }
+    }
+
+    fn cloud_service(d: &Path, label: &'static str, remote: bool) -> Service {
+        fs::create_dir_all(d.join("C")).unwrap();
+        fs::create_dir_all(d.join("G")).unwrap();
+        let base = d.to_string_lossy().into_owned();
+        let factory: Arc<PolicyFactory> = Arc::new(move |_: &[String]| {
+            let mut p = SafetyPolicy::empty(PathStyle::Posix);
+            p.protect(&format!("{base}/C/Windows"))
+                .map_err(|e| ApiError::with("policy", e))?;
+            Ok(p)
+        });
+        service(d).with_migrate(MigrateParts {
+            procs: Arc::new(SharedProcs::default()),
+            rm: Arc::new(FakeRmFinder(vec![])),
+            volumes: Arc::new(LabelVolumes {
+                normal: d.join("C"),
+                cloud: d.join("G"),
+                label,
+                remote,
+            }),
+            copier: Arc::new(StdCopier),
+            mover: Arc::new(StdMover),
+            links: Arc::new(SymLinks),
+            policy_factory: factory,
+            manifest_path: d.join("meta/m.json"),
+            program_dirs: vec![],
+            system_dirs: vec![],
+            self_pid: 999,
+            stop_timing: StopTiming::default(),
+        })
+    }
+
+    fn names_in_root(svc: &Service) -> Vec<String> {
+        names_at(svc, &[])
+    }
+
+    #[test]
+    fn cloud_sync_folders_are_left_out_of_the_scan_and_reported() {
+        let d = sandbox();
+        write(&d.join("local/a.bin"), 100);
+        write(&d.join("Google Drive/huge.bin"), 9_999);
+        write(&d.join("OneDrive - 某公司/文档.docx"), 777);
+        write(&d.join("local/Dropbox/x.bin"), 55);
+        let svc = service(&d);
+        let sum = svc.scan(d.to_str().unwrap(), &mut |_| {}).unwrap();
+        assert_eq!(sum.total_size, 100, "云目录里的内容不能计入总量");
+        assert_eq!(names_in_root(&svc), ["local"]);
+        let mut ex: Vec<(String, String)> = sum
+            .excluded
+            .iter()
+            .map(|e| {
+                (
+                    Path::new(&e.path)
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    e.reason.clone(),
+                )
+            })
+            .collect();
+        ex.sort();
+        assert_eq!(
+            ex,
+            [
+                ("Dropbox".into(), "Dropbox".into()),
+                ("Google Drive".into(), "Google Drive".into()),
+                ("OneDrive - 某公司".into(), "OneDrive".into())
+            ]
+        );
+        assert!(
+            !sum.top_files.iter().any(|f| f.path.contains("huge.bin")),
+            "最大文件里也不能出现云盘文件"
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn analyzing_the_cloud_can_be_switched_on_and_custom_paths_still_apply() {
+        let d = sandbox();
+        write(&d.join("local/a.bin"), 100);
+        write(&d.join("Google Drive/huge.bin"), 9_999);
+        write(&d.join("games/g.bin"), 5_000);
+        let svc = service(&d);
+        let env = Env::from_pairs([("X", "y")]);
+        let on = CloudRules::new(true, &[], &env);
+        assert_eq!(
+            svc.scan_with(d.to_str().unwrap(), &on, &mut |_| {})
+                .unwrap()
+                .total_size,
+            15_099
+        );
+        let custom = CloudRules::new(
+            true,
+            &[d.join("games").to_string_lossy().into_owned()],
+            &env,
+        );
+        let sum = svc
+            .scan_with(d.to_str().unwrap(), &custom, &mut |_| {})
+            .unwrap();
+        assert_eq!(sum.total_size, 10_099, "自定义跳过的路径始终生效");
+        assert_eq!(sum.excluded.len(), 1);
+        assert_eq!(sum.excluded[0].reason, "custom");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn the_mft_fast_path_is_pruned_afterwards() {
+        let d = sandbox();
+        write(&d.join("local/a.bin"), 10);
+        let file = |n: &str, size| Node {
+            name: n.into(),
+            is_dir: false,
+            size,
+            file_count: 1,
+            children: vec![],
+        };
+        let dir = |n: &str, kids: Vec<Node>| Node {
+            name: n.into(),
+            is_dir: true,
+            size: kids.iter().map(|k| k.size).sum(),
+            file_count: kids.iter().map(|k| k.file_count).sum(),
+            children: kids,
+        };
+        let root_dir = d.clone();
+        let tree = dir(
+            "root",
+            vec![
+                dir("Google Drive", vec![file("big.bin", 9_000)]),
+                dir(
+                    "users",
+                    vec![file("u.bin", 50), dir("Dropbox", vec![file("d.bin", 400)])],
+                ),
+            ],
+        );
+        let svc = service_fast(
+            &d,
+            Some(Box::new(move |_, _, _| {
+                Ok(ScanOutcome {
+                    root: tree.clone(),
+                    skipped: vec![],
+                    excluded: vec![],
+                    cancelled: false,
+                })
+            })),
+        );
+        let sum = svc.scan(&root_dir.to_string_lossy(), &mut |_| {}).unwrap();
+        assert_eq!(sum.method, "mft");
+        assert_eq!(
+            sum.total_size, 50,
+            "9000 和 400 字节的云目录被剪掉，上级总量同步扣除"
+        );
+        assert_eq!(sum.file_count, 1);
+        assert_eq!(sum.excluded.iter().map(|e| e.size).sum::<u64>(), 9_400);
+        assert_eq!(names_in_root(&svc), ["users"]);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn scanning_inside_a_cloud_folder_or_on_a_cloud_drive_is_refused() {
+        let d = sandbox();
+        write(&d.join("Google Drive/Projects/a.bin"), 10);
+        let svc = service(&d);
+        for p in ["Google Drive", "Google Drive/Projects"] {
+            let err = svc
+                .scan(&d.join(p).to_string_lossy(), &mut |_| {})
+                .unwrap_err();
+            assert_eq!(err.code, "cloud_location", "{p}");
+            assert_eq!(err.detail.as_deref(), Some("Google Drive"));
+        }
+        assert_eq!(
+            svc.dup_scan(&d.join("Google Drive").to_string_lossy(), 1, &mut |_| {})
+                .unwrap_err()
+                .code,
+            "cloud_location"
+        );
+        // 打开"分析云端"后允许。
+        let on = CloudRules::new(true, &[], &Env::default());
+        assert!(svc
+            .scan_with(&d.join("Google Drive").to_string_lossy(), &on, &mut |_| {})
+            .is_ok());
+
+        // 虚拟盘符：卷标是 Google Drive。
+        let d2 = sandbox();
+        write(&d2.join("G/My Drive/x.bin"), 10);
+        write(&d2.join("C/ok.bin"), 10);
+        let gd = cloud_service(&d2, "Google Drive", false);
+        assert_eq!(
+            gd.scan(&d2.join("G").to_string_lossy(), &mut |_| {})
+                .unwrap_err()
+                .code,
+            "cloud_location"
+        );
+        assert!(gd
+            .scan(&d2.join("C").to_string_lossy(), &mut |_| {})
+            .is_ok());
+        let net = cloud_service(&sandbox(), "Data", true);
+        let _ = net;
+        fs::remove_dir_all(&d).unwrap();
+        fs::remove_dir_all(&d2).unwrap();
+    }
+
+    #[test]
+    fn network_drives_are_treated_as_remote_and_excluded_too() {
+        let d = sandbox();
+        write(&d.join("G/x.bin"), 10);
+        let svc = cloud_service(&d, "Data", true);
+        let err = svc
+            .scan(&d.join("G").to_string_lossy(), &mut |_| {})
+            .unwrap_err();
+        assert_eq!(
+            (err.code, err.detail.as_deref()),
+            ("cloud_location", Some("Network"))
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn the_drive_list_marks_cloud_and_network_drives() {
+        let d = sandbox();
+        let svc = cloud_service(&d, "Google Drive", false);
+        // 本机真实磁盘（测试环境）没有云盘卷标，所以没有任何一个被标记。
+        assert!(svc.drives().iter().all(|x| x.cloud.is_none()));
+    }
+
+    #[test]
+    fn duplicates_do_not_look_inside_cloud_folders() {
+        let d = sandbox();
+        write(&d.join("local/a.bin"), 5000);
+        write(&d.join("Google Drive/a-copy.bin"), 5000);
+        let svc = service(&d);
+        let sum = svc.dup_scan(d.to_str().unwrap(), 1, &mut |_| {}).unwrap();
+        assert!(sum.groups.is_empty());
+        assert_eq!(sum.excluded.len(), 1);
+        let on = CloudRules::new(true, &[], &Env::default());
+        assert_eq!(
+            svc.dup_scan_with(d.to_str().unwrap(), 1, &on, &mut |_| {})
+                .unwrap()
+                .groups
+                .len(),
+            1
+        );
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn cloud_sync_folders_cannot_be_migrated_even_when_cloud_analysis_is_on() {
+        let d = sandbox();
+        write(&d.join("C/Dropbox/a.bin"), 10);
+        let svc = cloud_service(&d, "Data", false);
+        let p = svc
+            .mig_preflight(
+                &d.join("C/Dropbox").to_string_lossy(),
+                &d.join("G/x").to_string_lossy(),
+                &[],
+            )
+            .unwrap();
+        assert!(p
+            .issues
+            .iter()
+            .any(|i| i.code == "cloud_location" && i.severity == "error"));
+        assert!(!p.can_proceed);
+        fs::remove_dir_all(&d).unwrap();
     }
 }
