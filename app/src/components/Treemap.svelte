@@ -5,6 +5,7 @@
   import { groupSmall, hueOf, squarify, type Tile } from '../lib/treemap';
   import { refresh } from '../lib/refresh.svelte';
   import type { Child } from '../lib/types';
+  import PickButton from './PickButton.svelte';
 
   let { rootName, parts = $bindable([]) }: { rootName: string; parts: string[] } = $props();
 
@@ -72,6 +73,9 @@
       {/if}
     {/each}
     <span class="grow"></span>
+    {#if parts.length > 0}
+      <PickButton parts={parts} name={parts[parts.length - 1]} size={total} is_dir={true} file_count={children.reduce((a, c) => a + c.file_count, 0)} label />
+    {/if}
     <span class="muted num">{formatSize(total)}</span>
   </nav>
 
@@ -83,6 +87,9 @@
       {@const label = r.w > 76 && r.h > 38}
       {#if 'child' in tile.data}
         {@const c = tile.data.child}
+        <span class="pickwrap" style="left:{r.x + r.w - 28}px;top:{r.y + 3}px" hidden={r.w < 60 || r.h < 34}>
+          <PickButton parts={[...parts, c.name]} name={c.name} size={c.size} is_dir={c.is_dir} file_count={c.file_count} />
+        </span>
         {#if c.is_dir}
           <button
             class="tile dir"
@@ -137,6 +144,8 @@
   button.tile:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; z-index: 1; }
   .file { background: var(--bar); color: var(--text); }
   .other { background: repeating-linear-gradient(45deg, var(--surface-2), var(--surface-2) 6px, var(--bar) 6px, var(--bar) 7px); color: var(--muted); }
+  .pickwrap { position: absolute; z-index: 2; background: color-mix(in srgb, var(--surface) 85%, transparent); border-radius: 6px; line-height: 0; }
+  .pickwrap[hidden] { display: none; }
   .nm { font-weight: 600; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sz { opacity: 0.85; font-size: 11.5px; }
   .empty { position: absolute; inset: 0; display: grid; place-items: center; }

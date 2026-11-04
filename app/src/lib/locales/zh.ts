@@ -38,6 +38,7 @@ export const zh: Record<string, string> = {
   'scan.minNote': '已隐藏小于 {size} 的文件和文件夹（大小仍计入总量）。',
   'scan.smallFolded': '另有 {n} 个小文件/小文件夹未单独列出，合计 {size}',
   'scan.view.pie': '饼图',
+  'pie.hint': '点击带 + 的按钮把文件或文件夹加入候选，再在候选清单里统一清理。',
   'pie.label': '空间占用饼图',
   'pie.total': '当前目录',
   'pie.other': '其他',

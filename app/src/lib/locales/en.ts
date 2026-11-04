@@ -38,6 +38,7 @@ export const en: Record<string, string> = {
   'scan.minNote': 'Items under {size} are hidden (their size still counts in the total).',
   'scan.smallFolded': '{n} small files/folders not listed, {size} in total',
   'scan.view.pie': 'Pie',
+  'pie.hint': 'Use the + button to add a file or folder to the candidates, then clean them up together from the candidate list.',
   'pie.label': 'Space usage pie chart',
   'pie.total': 'this folder',
   'pie.other': 'Other',

@@ -6,6 +6,7 @@
   import { hueOf } from '../lib/treemap';
   import { refresh } from '../lib/refresh.svelte';
   import Icon from './Icon.svelte';
+  import PickButton from './PickButton.svelte';
   import { iconKind } from '../lib/fileicon';
   import type { Child } from '../lib/types';
 
@@ -51,6 +52,13 @@
   const crumbs = $derived([rootName, ...parts]);
   const color = (name: string | null) => (name === null ? 'var(--bar)' : `hsl(${hueOf(name)} 50% 42%)`);
 
+  const here = $derived({
+    size: total,
+    files: children.reduce((a, c) => a + c.file_count, 0) + smallFiles,
+  });
+
+  const reveal = (p: string[]) => api.reveal(p).catch(() => {});
+
   function open(i: number) {
     const it = slices[i]?.item;
     if (it?.is_dir) parts = [...parts, it.name];
@@ -67,6 +75,11 @@
         <strong>{c}</strong>
       {/if}
     {/each}
+    <span class="grow"></span>
+    {#if parts.length > 0}
+      <PickButton parts={parts} name={parts[parts.length - 1]} size={here.size} is_dir={true} file_count={here.files} label />
+      <button class="link" onclick={() => reveal(parts)}>{t('scan.reveal')}</button>
+    {/if}
   </nav>
 
   {#if error}<div class="error" role="alert">{error}</div>{/if}
@@ -113,10 +126,19 @@
             {/if}
             <span class="num sz">{formatSize(s.size)}</span>
             <span class="num pc muted">{percent(s.size, total).toFixed(1)}%</span>
+            {#if s.item}
+              <PickButton parts={[...parts, s.item.name]} name={s.item.name} size={s.item.size} is_dir={s.item.is_dir} file_count={children.find((c) => c.name === s.item?.name)?.file_count ?? 1} />
+              <button class="link rev" title={t('scan.reveal')} aria-label={t('scan.reveal')} onclick={() => reveal([...parts, s.item!.name])}>
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M3 7h6l2 2h10v10H3z" /></svg>
+              </button>
+            {:else}
+              <span class="ph"></span>
+            {/if}
           </li>
         {/each}
       </ul>
     </div>
+    <p class="muted small">{t('pie.hint')}</p>
     {#if smallSize > 0}
       <p class="muted small">{t('pie.small', { n: smallFiles.toLocaleString(), size: formatSize(smallSize) })}</p>
     {/if}
@@ -141,4 +163,7 @@
   .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
   .sz { min-width: 70px; text-align: right; }
   .pc { min-width: 48px; text-align: right; }
+  .ph { width: 48px; }
+  .rev { padding: 3px; }
+  .grow { flex: 1; }
 </style>
