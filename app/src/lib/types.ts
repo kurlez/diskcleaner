@@ -95,6 +95,8 @@ export interface Api {
   planDiscard(): Promise<void>;
   planExecute(dryRun: boolean, recycle: boolean): Promise<Report>;
   cleanCancel(): Promise<void>;
+  appStatus(): Promise<{ elevated: boolean }>;
+  relaunchAsAdmin(): Promise<void>;
   settingsGet(): Promise<Settings>;
   settingsSetExclusions(exclusions: string[]): Promise<Settings>;
   settingsSetCloud(analyzeCloud: boolean, skipPaths: string[]): Promise<Settings>;

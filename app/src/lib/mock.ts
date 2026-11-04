@@ -199,6 +199,8 @@ export const mockApi: Api = {
     return rep;
   },
   async cleanCancel() { cancelClean = true; },
+  async appStatus() { return { elevated: (window as any).__mockElevated ?? false }; },
+  async relaunchAsAdmin() { if ((window as any).__mockUacCancel) throw { code: 'uac_cancelled' }; (window as any).__mockElevated = true; },
   async settingsGet(): Promise<Settings> { return { exclusions, analyze_cloud: analyzeCloud, skip_paths: skipPaths }; },
   async settingsSetCloud(analyze, paths) {
     if (paths.some((p) => !/^[A-Za-z]:\\/.test(p))) throw { code: 'invalid_skip_path', detail: paths.find((p) => !/^[A-Za-z]:\\/.test(p)) };

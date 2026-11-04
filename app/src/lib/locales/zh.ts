@@ -1,5 +1,12 @@
 export const zh: Record<string, string> = {
   'app.title': 'DiskClean',
+  'err.uac_cancelled': '已取消管理员授权，仍以普通权限运行。',
+  'err.relaunch_failed': '重新启动失败。',
+  'admin.title': '当前未以管理员身份运行',
+  'admin.desc': '部分功能（完整磁盘快速扫描、系统工具、迁移、清理受保护目录）需要管理员权限。',
+  'admin.restart': '以管理员身份重新启动',
+  'admin.cancelled': '已取消管理员授权，仍以普通权限运行。',
+  'admin.failed': '重新启动失败：',
   'nav.dashboard': '概览',
   'nav.scan': '磁盘分析',
   'nav.clean': '智能清理',

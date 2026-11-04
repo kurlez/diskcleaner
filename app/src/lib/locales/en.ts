@@ -1,5 +1,12 @@
 export const en: Record<string, string> = {
   'app.title': 'DiskClean',
+  'err.uac_cancelled': 'Elevation was cancelled; still running without admin rights.',
+  'err.relaunch_failed': 'Restart failed.',
+  'admin.title': 'Not running as administrator',
+  'admin.desc': 'Some features (fast full-disk scan, system tools, migration, cleaning protected folders) need administrator rights.',
+  'admin.restart': 'Restart as administrator',
+  'admin.cancelled': 'Elevation was cancelled; still running without admin rights.',
+  'admin.failed': 'Restart failed: ',
   'nav.dashboard': 'Overview',
   'nav.scan': 'Disk analysis',
   'nav.clean': 'Smart clean',

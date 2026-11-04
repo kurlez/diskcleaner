@@ -8,6 +8,7 @@
   import Migrate from './views/Migrate.svelte';
   import Clean from './views/Clean.svelte';
   import SettingsView from './views/Settings.svelte';
+  import AdminBanner from './components/AdminBanner.svelte';
 
   setLocale(i18n.locale);
 
@@ -48,6 +49,7 @@
   </nav>
 
   <main>
+    <AdminBanner />
     <section hidden={nav.view !== 'dashboard'}><Dashboard /></section>
     <section hidden={nav.view !== 'scan'}><Scan /></section>
     <section hidden={nav.view !== 'duplicates'}><Duplicates /></section>

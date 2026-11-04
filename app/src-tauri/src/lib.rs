@@ -1,3 +1,4 @@
+mod elevation;
 mod service;
 mod settings;
 
@@ -504,6 +505,34 @@ async fn mig_restore(
     .await
 }
 
+#[derive(serde::Serialize)]
+struct AppStatus {
+    /// 当前进程是否以管理员身份运行。
+    elevated: bool,
+}
+
+#[tauri::command]
+fn app_status() -> AppStatus {
+    AppStatus {
+        elevated: elevation::is_elevated(),
+    }
+}
+
+/// 以管理员身份重新启动：弹出 UAC，用户同意后启动新实例并退出当前进程；
+/// 用户拒绝时返回错误，当前窗口保持不变。
+#[tauri::command]
+fn relaunch_as_admin(app: AppHandle) -> Result<(), ApiError> {
+    match elevation::relaunch_elevated() {
+        Ok(()) => {
+            app.exit(0);
+            Ok(())
+        }
+        Err(elevation::RelaunchError::Cancelled) => Err(ApiError::new("uac_cancelled")),
+        Err(elevation::RelaunchError::Unsupported) => Err(ApiError::new("unsupported_platform")),
+        Err(elevation::RelaunchError::Failed(m)) => Err(ApiError::with("relaunch_failed", m)),
+    }
+}
+
 #[tauri::command]
 fn settings_get(state: State<'_, AppState>) -> Settings {
     state.settings.lock().unwrap().clone()
@@ -626,6 +655,8 @@ pub fn run() {
             mig_cancel,
             mig_list,
             mig_restore,
+            app_status,
+            relaunch_as_admin,
             settings_get,
             settings_set_exclusions,
             settings_set_cloud,

@@ -18,7 +18,7 @@ cargo run -p diskclean-cli -- rules
 cd app
 npm install
 npm run tauri dev      # 开发版，不要求管理员
-npm run tauri build    # 发布版，生成 NSIS/MSI，运行时弹 UAC
+npm run tauri build    # 发布版，生成 NSIS 安装包，运行时弹 UAC
 ```
 
 仅预览界面（任意平台，使用模拟数据）：

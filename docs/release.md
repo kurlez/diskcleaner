@@ -8,7 +8,7 @@ npm ci
 npm run tauri build
 ```
 
-产物在 `target/release/bundle/`：`nsis/*.exe` 与 `msi/*.msi`。发布版的可执行文件内嵌
+产物在 `target/release/bundle/`：`nsis/*.exe`。发布版的可执行文件内嵌
 `requireAdministrator` manifest，启动时会弹出 UAC。
 
 持续集成（`.github/workflows/ci.yml`）在每次推送时：

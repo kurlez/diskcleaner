@@ -689,6 +689,7 @@ dependencies = [
  "sysinfo 0.37.2",
  "tauri",
  "tauri-build",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

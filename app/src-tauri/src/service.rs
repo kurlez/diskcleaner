@@ -2039,6 +2039,14 @@ fn skip_counts(plan: &Plan) -> Vec<SkipCount> {
 
 #[cfg(test)]
 mod tests {
+    /// 测试用的路径风格：Windows 上临时目录是 `C:\...`，必须用 Windows 风格才能匹配。
+    fn test_style() -> PathStyle {
+        if cfg!(windows) {
+            PathStyle::Windows
+        } else {
+            PathStyle::Posix
+        }
+    }
     use super::*;
     use diskclean_core::rules::{Target, TargetKind};
     use diskclean_core::safety::PathStyle;
@@ -2074,7 +2082,7 @@ mod tests {
         };
         let base_s = base.to_string_lossy().into_owned();
         let factory: Box<PolicyFactory> = Box::new(move |excl: &[String]| {
-            let mut p = SafetyPolicy::empty(PathStyle::Posix);
+            let mut p = SafetyPolicy::empty(test_style());
             p.protect(&base_s)
                 .map_err(|e| ApiError::with("policy", e))?;
             for x in excl {
@@ -2343,7 +2351,7 @@ mod tests {
         let base_s = base.to_string_lossy().into_owned();
         let sub = protect_sub.map(|s| base.join(s).to_string_lossy().into_owned());
         Box::new(move |excl: &[String]| {
-            let mut p = SafetyPolicy::empty(PathStyle::Posix);
+            let mut p = SafetyPolicy::empty(test_style());
             if let Some(sub) = &sub {
                 p.protect(sub).map_err(|e| ApiError::with("policy", e))?;
             } else {
@@ -2716,7 +2724,7 @@ mod tests {
     fn app_service(base: &Path, reg: Arc<MemRegistry>, runner: Arc<dyn CommandRunner>) -> Service {
         let base_s = base.to_string_lossy().into_owned();
         let factory: Box<PolicyFactory> = Box::new(move |excl: &[String]| {
-            let mut p = SafetyPolicy::empty(PathStyle::Posix);
+            let mut p = SafetyPolicy::empty(test_style());
             p.protect(&format!("{base_s}/Windows"))
                 .map_err(|e| ApiError::with("policy", e))?;
             for x in excl {
@@ -3361,7 +3369,7 @@ mod tests {
         fs::create_dir_all(d.join("D")).unwrap();
         let base = d.to_string_lossy().into_owned();
         let factory: Arc<PolicyFactory> = Arc::new(move |excl: &[String]| {
-            let mut p = SafetyPolicy::empty(PathStyle::Posix);
+            let mut p = SafetyPolicy::empty(test_style());
             p.protect(&format!("{base}/C/Windows"))
                 .map_err(|e| ApiError::with("policy", e))?;
             for x in excl {
@@ -4036,7 +4044,7 @@ mod tests {
         fs::create_dir_all(d.join("G")).unwrap();
         let base = d.to_string_lossy().into_owned();
         let factory: Arc<PolicyFactory> = Arc::new(move |_: &[String]| {
-            let mut p = SafetyPolicy::empty(PathStyle::Posix);
+            let mut p = SafetyPolicy::empty(test_style());
             p.protect(&format!("{base}/C/Windows"))
                 .map_err(|e| ApiError::with("policy", e))?;
             Ok(p)
