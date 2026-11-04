@@ -75,7 +75,8 @@ jobs:
 
   release:
     name: Publish release
-    if: startsWith(github.ref, 'refs/tags/v')
+    # 推送 v* 标签，或主分支上提交信息以 "release:" 开头时发布。
+    if: startsWith(github.ref, 'refs/tags/v') || (github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release:'))
     needs: [windows-installer]
     runs-on: ubuntu-24.04
     permissions:
@@ -84,6 +85,17 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: diskclean-windows-unsigned
+      - name: Read version
+        id: ver
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then v="${GITHUB_REF_NAME}"; else v="v$(gh api repos/${{ github.repository }}/contents/app/src-tauri/tauri.conf.json?ref=${{ github.sha }} -H 'Accept: application/vnd.github.raw' | jq -r .version)"; fi
+          echo "tag=$v" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: DiskClean ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
           files: "*.exe"
