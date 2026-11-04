@@ -2279,7 +2279,7 @@ mod tests {
                 p.strip_prefix(&sb.base)
                     .unwrap()
                     .to_string_lossy()
-                    .into_owned()
+                    .replace('\\', "/")
             })
             .collect();
         v.sort();

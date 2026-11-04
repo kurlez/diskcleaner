@@ -2864,7 +2864,7 @@ mod tests {
         let by_path = |needle: &str| {
             left.items
                 .iter()
-                .find(|i| i.path.contains(needle) && i.value_name.is_none())
+                .find(|i| i.path.replace('\\', "/").contains(needle) && i.value_name.is_none())
                 .unwrap_or_else(|| panic!("{needle} not found in {:#?}", left.items))
         };
         assert_eq!(by_path("PF/Foo").kind, "folder");
@@ -2882,7 +2882,10 @@ mod tests {
         let run_val = left.items.iter().find(|i| i.kind == "reg_value").unwrap();
         assert_eq!(run_val.value_name.as_deref(), Some("FooTray"));
         assert!(
-            !left.items.iter().any(|i| i.path.contains("PF/Bar")),
+            !left
+                .items
+                .iter()
+                .any(|i| i.path.replace('\\', "/").contains("PF/Bar")),
             "别的程序不能列出来"
         );
         assert_eq!(left.total_size, 130);
@@ -3965,7 +3968,13 @@ mod tests {
         let resolved = svc
             .cand_resolve(&[parts(&["资料库", "二级目录 📁", "日本語.txt"])])
             .unwrap();
-        assert!(resolved[0].path.ends_with("资料库/二级目录 📁/日本語.txt") && resolved[0].exists);
+        assert!(
+            resolved[0]
+                .path
+                .replace('\\', "/")
+                .ends_with("资料库/二级目录 📁/日本語.txt")
+                && resolved[0].exists
+        );
 
         let rep = svc
             .cand_delete(
