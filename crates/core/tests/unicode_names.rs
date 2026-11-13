@@ -92,16 +92,17 @@ fn the_scanner_reports_every_name_exactly() {
         "不能出现替换字符"
     );
     // 预组合与分解形式是两个不同的文件，不能被合并。
+    let expected = if cfg!(target_os = "macos") { 1 } else { 2 };
     assert_eq!(
         names().iter().filter(|n| n.starts_with("caf")).count(),
-        if cfg!(target_os = "macos") { 1 } else { 2 }
+        expected
     );
     assert_eq!(
         sub.children
             .iter()
             .filter(|c| c.name.starts_with("caf"))
             .count(),
-        2
+        expected
     );
 }
 
