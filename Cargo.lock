@@ -700,7 +700,7 @@ dependencies = [
 
 [[package]]
 name = "diskclean-app"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "diskclean-core",
  "serde",
@@ -713,14 +713,14 @@ dependencies = [
 
 [[package]]
 name = "diskclean-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "diskclean-core",
 ]
 
 [[package]]
 name = "diskclean-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "encoding_rs",
