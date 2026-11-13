@@ -726,6 +726,7 @@ dependencies = [
  "encoding_rs",
  "flate2",
  "ntfs",
+ "plist",
  "rayon",
  "same-file",
  "serde",

@@ -144,10 +144,94 @@ pub fn windows_rules() -> Vec<Rule> {
     ]
 }
 
+/// macOS 内置规则。路径模板用 `%HOME%`（用户主目录），其余约定与 Windows 规则相同。
+/// 只清理可再生数据；Trash 与 iOS 备份这类"用户可能还需要"的内容默认不勾选。
+pub fn mac_rules() -> Vec<Rule> {
+    use Risk::{High, Low, Medium};
+    vec![
+        // 应用缓存：保留最近三天内用过的，避免动到正在使用的缓存。
+        rule(
+            "mac_app_caches",
+            Low,
+            true,
+            vec![aged("%HOME%/Library/Caches", 3)],
+        ),
+        rule("mac_logs", Low, true, vec![aged("%HOME%/Library/Logs", 7)]),
+        rule(
+            "mac_browser_cache",
+            Low,
+            true,
+            vec![
+                // 只含网页缓存，不含密码、Cookie 和历史记录。
+                contents("%HOME%/Library/Caches/Google/Chrome"),
+                contents("%HOME%/Library/Caches/com.apple.Safari"),
+                contents("%HOME%/Library/Caches/Microsoft Edge"),
+                contents("%HOME%/Library/Caches/Firefox/Profiles/*/cache2"),
+                contents("%HOME%/Library/Caches/BraveSoftware"),
+            ],
+        ),
+        rule("mac_trash", Medium, false, vec![contents("%HOME%/.Trash")]),
+        rule(
+            "mac_xcode",
+            Medium,
+            false,
+            vec![
+                contents("%HOME%/Library/Developer/Xcode/DerivedData"),
+                contents("%HOME%/Library/Developer/Xcode/iOS DeviceSupport"),
+                contents("%HOME%/Library/Developer/Xcode/watchOS DeviceSupport"),
+                contents("%HOME%/Library/Developer/CoreSimulator/Caches"),
+            ],
+        ),
+        rule(
+            "mac_dev_caches",
+            Medium,
+            false,
+            vec![
+                contents("%HOME%/.npm/_cacache"),
+                contents("%HOME%/.cargo/registry/cache"),
+                contents("%HOME%/.cargo/registry/src"),
+                contents("%HOME%/.gradle/caches"),
+                contents("%HOME%/Library/Caches/Homebrew"),
+                contents("%HOME%/Library/Caches/CocoaPods"),
+                contents("%HOME%/.cache"),
+            ],
+        ),
+        // iPhone/iPad 的本地备份往往几十 GB，但可能是唯一的备份，所以风险最高。
+        rule(
+            "mac_ios_backups",
+            High,
+            false,
+            vec![contents(
+                "%HOME%/Library/Application Support/MobileSync/Backup",
+            )],
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn mac_rules_are_well_formed() {
+        let rules = mac_rules();
+        let ids: HashSet<_> = rules.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids.len(), rules.len());
+        for r in &rules {
+            assert!(r.services.is_empty());
+            if r.default_selected {
+                assert_eq!(r.risk, Risk::Low, "{} is selected but not low risk", r.id);
+            }
+            for t in &r.targets {
+                assert!(t.path.starts_with("%HOME%/"), "{}", t.path);
+                assert!(!t.path.contains('\\'));
+            }
+        }
+        // Windows 与 macOS 的规则 ID 不重叠，界面翻译键不会冲突。
+        let win: HashSet<_> = windows_rules().into_iter().map(|r| r.id).collect();
+        assert!(rules.iter().all(|r| !win.contains(&r.id)));
+    }
 
     #[test]
     fn ids_unique_and_defaults_are_low_risk() {

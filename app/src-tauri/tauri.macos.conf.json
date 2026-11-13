@@ -1,0 +1,10 @@
+{
+  "bundle": {
+    "targets": ["dmg"],
+    "category": "public.app-category.utilities",
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": "-"
+    }
+  }
+}

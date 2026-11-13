@@ -99,6 +99,31 @@ impl Shared<'_> {
     }
 }
 
+static USE_ALLOCATED: AtomicBool = AtomicBool::new(false);
+
+/// 统计文件大小时是否取"实际占用"（`st_blocks`，仅 Unix 有效）而不是逻辑大小。
+///
+/// macOS 的 APFS 有稀疏文件、压缩文件和虚拟机磁盘镜像，逻辑大小与真正占用的空间差别很大，
+/// 所以应用启动时在 macOS 上打开它；默认关闭，让测试里的字节数断言在所有平台一致。
+pub fn use_allocated_sizes(on: bool) {
+    USE_ALLOCATED.store(on, Ordering::Relaxed);
+}
+
+#[cfg(unix)]
+fn file_size(meta: &Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    if USE_ALLOCATED.load(Ordering::Relaxed) {
+        meta.blocks() * 512
+    } else {
+        meta.len()
+    }
+}
+
+#[cfg(not(unix))]
+fn file_size(meta: &Metadata) -> u64 {
+    meta.len()
+}
+
 pub fn special_reason(meta: &Metadata) -> Option<SkipReason> {
     #[cfg(windows)]
     {
@@ -249,13 +274,13 @@ fn walk(path: &Path, name: String, depth: usize, sh: &Shared) -> Node {
             subdirs.push((child_path, child_name));
         } else {
             sh.files.fetch_add(1, Ordering::Relaxed);
-            sh.bytes.fetch_add(meta.len(), Ordering::Relaxed);
-            node.size += meta.len();
+            sh.bytes.fetch_add(file_size(&meta), Ordering::Relaxed);
+            node.size += file_size(&meta);
             node.file_count += 1;
             node.children.push(Node {
                 name: child_name,
                 is_dir: false,
-                size: meta.len(),
+                size: file_size(&meta),
                 file_count: 1,
                 children: Vec::new(),
             });

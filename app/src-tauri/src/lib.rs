@@ -5,7 +5,7 @@ mod settings;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use diskclean_core::builtin::windows_rules;
+use diskclean_core::builtin::{mac_rules, windows_rules};
 use diskclean_core::cloud;
 use diskclean_core::migrate::{self, LinkMaker, MklinkJunction};
 use diskclean_core::procs;
@@ -81,8 +81,24 @@ fn with_exclusions(
     Ok(policy)
 }
 
-/// 生产环境的安全策略：Windows 默认保护名单 + 用户排除项。
+/// 是否在 macOS 上运行。
+const IS_MAC: bool = cfg!(target_os = "macos");
+
+/// macOS 用户主目录。
+fn mac_home() -> Result<String, ApiError> {
+    std::env::var("HOME")
+        .ok()
+        .filter(|h| h.starts_with('/'))
+        .ok_or(ApiError::new("unsupported_platform"))
+}
+
+/// 生产环境的安全策略：平台默认保护名单（Windows 或 macOS）+ 用户排除项。
 fn windows_policy(exclusions: &[String]) -> Result<SafetyPolicy, ApiError> {
+    if IS_MAC {
+        let policy =
+            SafetyPolicy::new_mac(&mac_home()?).map_err(|e| ApiError::with("policy", e))?;
+        return with_exclusions(policy, exclusions);
+    }
     let dirs = KnownDirs::from_env().ok_or(ApiError::new("unsupported_platform"))?;
     let policy = SafetyPolicy::new(&dirs).map_err(|e| ApiError::with("policy", e))?;
     with_exclusions(policy, exclusions)
@@ -90,6 +106,11 @@ fn windows_policy(exclusions: &[String]) -> Result<SafetyPolicy, ApiError> {
 
 /// 用户亲自选中文件时的策略（删除重复文件）：不保护用户文档，但系统和 AppData 仍受保护。
 fn windows_selected_policy(exclusions: &[String]) -> Result<SafetyPolicy, ApiError> {
+    if IS_MAC {
+        let policy = SafetyPolicy::for_user_selected_mac(&mac_home()?)
+            .map_err(|e| ApiError::with("policy", e))?;
+        return with_exclusions(policy, exclusions);
+    }
     let dirs = KnownDirs::from_env().ok_or(ApiError::new("unsupported_platform"))?;
     let policy = SafetyPolicy::for_user_selected(&dirs).map_err(|e| ApiError::with("policy", e))?;
     with_exclusions(policy, exclusions)
@@ -97,6 +118,11 @@ fn windows_selected_policy(exclusions: &[String]) -> Result<SafetyPolicy, ApiErr
 
 /// 删除卸载残留时的策略：默认保护名单 + 应用常驻目录的内部 + 用户排除项。
 fn windows_leftover_policy(exclusions: &[String]) -> Result<SafetyPolicy, ApiError> {
+    if IS_MAC {
+        let policy = diskclean_core::macapps::mac_leftover_policy(&mac_home()?)
+            .map_err(|e| ApiError::with("policy", e))?;
+        return with_exclusions(policy, exclusions);
+    }
     let dirs = KnownDirs::from_env().ok_or(ApiError::new("unsupported_platform"))?;
     let roots = FsRoots::from_env(&Env::from_process());
     let policy =
@@ -106,6 +132,11 @@ fn windows_leftover_policy(exclusions: &[String]) -> Result<SafetyPolicy, ApiErr
 
 /// 目录迁移的安全策略：系统目录和用户根目录本身禁止，应用数据等子目录允许。
 fn windows_migration_policy(exclusions: &[String]) -> Result<SafetyPolicy, ApiError> {
+    if IS_MAC {
+        let policy =
+            migrate::mac_migration_policy(&mac_home()?).map_err(|e| ApiError::with("policy", e))?;
+        return with_exclusions(policy, exclusions);
+    }
     let dirs = KnownDirs::from_env().ok_or(ApiError::new("unsupported_platform"))?;
     let policy = migrate::migration_policy(&dirs).map_err(|e| ApiError::with("policy", e))?;
     with_exclusions(policy, exclusions)
@@ -127,24 +158,46 @@ impl LinkMaker for RunnerLinks {
 }
 
 #[cfg(windows)]
-fn open_file_finder() -> Arc<dyn procs::OpenFileFinder> {
+fn open_file_finder(_runner: Arc<dyn CommandRunner>) -> Arc<dyn procs::OpenFileFinder> {
     Arc::new(procs::RestartManager)
 }
 
-#[cfg(not(windows))]
-fn open_file_finder() -> Arc<dyn procs::OpenFileFinder> {
+#[cfg(target_os = "macos")]
+fn open_file_finder(runner: Arc<dyn CommandRunner>) -> Arc<dyn procs::OpenFileFinder> {
+    Arc::new(procs::LsofFinder(runner))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn open_file_finder(_runner: Arc<dyn CommandRunner>) -> Arc<dyn procs::OpenFileFinder> {
     Arc::new(procs::NoOpenFileFinder)
 }
 
-/// Windows 用 robocopy（保留 ACL 与所有者）；其他平台用纯 Rust 复制。
+/// Windows 用 robocopy（保留 ACL 与所有者），macOS 用 ditto（保留权限、扩展属性与符号链接）；
+/// 其他平台用纯 Rust 复制。
 #[cfg(windows)]
 fn real_copier() -> Arc<dyn migrate::Copier> {
     Arc::new(migrate::RobocopyCopier)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn real_copier() -> Arc<dyn migrate::Copier> {
+    Arc::new(migrate::DittoCopier)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn real_copier() -> Arc<dyn migrate::Copier> {
     Arc::new(migrate::StdCopier)
+}
+
+/// macOS 用符号链接代替 junction。
+#[cfg(target_os = "macos")]
+fn real_links(_runner: Arc<dyn CommandRunner>) -> Arc<dyn LinkMaker> {
+    Arc::new(migrate::SymlinkMaker)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn real_links(runner: Arc<dyn CommandRunner>) -> Arc<dyn LinkMaker> {
+    Arc::new(RunnerLinks(runner))
 }
 
 fn migrate_parts(manifest_path: PathBuf, runner: Arc<dyn CommandRunner>) -> MigrateParts {
@@ -156,15 +209,24 @@ fn migrate_parts(manifest_path: PathBuf, runner: Arc<dyn CommandRunner>) -> Migr
     };
     MigrateParts {
         procs: Arc::new(procs::SysinfoProcesses),
-        rm: open_file_finder(),
+        rm: open_file_finder(runner.clone()),
         volumes: Arc::new(migrate::SysVolumes),
         copier: real_copier(),
         mover: Arc::new(migrate::StdMover),
-        links: Arc::new(RunnerLinks(runner)),
+        links: real_links(runner),
         policy_factory: Arc::new(windows_migration_policy),
         manifest_path,
-        program_dirs: dirs(&["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"]),
-        system_dirs: dirs(&["SystemRoot"]),
+        program_dirs: if IS_MAC {
+            vec![PathBuf::from("/Applications")]
+        } else {
+            dirs(&["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"])
+        },
+        system_dirs: if IS_MAC {
+            vec![PathBuf::from("/System"), PathBuf::from("/Library")]
+        } else {
+            dirs(&["SystemRoot"])
+        },
+        unix_links: IS_MAC,
         self_pid: std::process::id(),
         stop_timing: procs::StopTiming::default(),
     }
@@ -255,7 +317,18 @@ fn reveal(path: &std::path::Path) -> Result<(), ApiError> {
         .map_err(|e| ApiError::with("internal", e))
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn reveal(path: &std::path::Path) -> Result<(), ApiError> {
+    // `open -R` 在访达里选中该项目。
+    std::process::Command::new("/usr/bin/open")
+        .arg("-R")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| ApiError::with("internal", e))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn reveal(_path: &std::path::Path) -> Result<(), ApiError> {
     Err(ApiError::new("unsupported_platform"))
 }
@@ -513,15 +586,57 @@ async fn mig_restore(
 
 #[derive(serde::Serialize)]
 struct AppStatus {
-    /// 当前进程是否以管理员身份运行。
+    /// 当前进程是否以管理员身份运行（Windows 才有意义；其他平台恒为 `true`）。
     elevated: bool,
+    /// `windows` / `macos` / `other`。界面据此调整文案与默认值。
+    platform: &'static str,
+    /// 用户主目录（Windows 为用户配置文件目录）。
+    home: String,
+    /// macOS：是否已授予"完全磁盘访问权限"；其他平台为 `None`。
+    full_disk_access: Option<bool>,
+}
+
+/// macOS 的"完全磁盘访问权限"检测：能打开受 TCC 保护的数据库就说明已授权。
+/// 没有这个权限时，`~/Library` 下的邮件、信息、Safari 等目录读不到，扫描结果会偏小。
+#[cfg(target_os = "macos")]
+fn full_disk_access() -> Option<bool> {
+    Some(std::fs::File::open("/Library/Application Support/com.apple.TCC/TCC.db").is_ok())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn full_disk_access() -> Option<bool> {
+    None
 }
 
 #[tauri::command]
 fn app_status() -> AppStatus {
     AppStatus {
         elevated: elevation::is_elevated(),
+        platform: if cfg!(windows) {
+            "windows"
+        } else if IS_MAC {
+            "macos"
+        } else {
+            "other"
+        },
+        home: std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap_or_default(),
+        full_disk_access: full_disk_access(),
     }
+}
+
+/// 打开系统设置里的"完全磁盘访问权限"页面（macOS）。
+#[tauri::command]
+fn open_privacy_settings() -> Result<(), ApiError> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("/usr/bin/open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| ApiError::with("internal", e))
+    }
+    #[cfg(not(target_os = "macos"))]
+    Err(ApiError::new("unsupported_platform"))
 }
 
 /// 以管理员身份重新启动：弹出 UAC，用户同意后启动新实例并退出当前进程；
@@ -557,7 +672,12 @@ fn settings_set_cloud(
         .collect();
     // 跳过路径必须是带盘符的完整路径，否则永远匹配不到，静默无效比报错更糟。
     for p in &skip_paths {
-        if diskclean_core::mft::split_drive_path(p).is_none() {
+        let valid = if IS_MAC {
+            p.starts_with('/')
+        } else {
+            diskclean_core::mft::split_drive_path(p).is_some()
+        };
+        if !valid {
             return Err(ApiError::with("invalid_skip_path", p));
         }
     }
@@ -594,6 +714,8 @@ fn settings_set_exclusions(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // macOS：按实际占用统计大小（稀疏文件、压缩文件、虚拟机镜像的逻辑大小会严重失真）。
+    diskclean_core::scanner::use_allocated_sizes(IS_MAC);
     tauri::Builder::default()
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
@@ -601,7 +723,7 @@ pub fn run() {
             let settings_path = config_dir.join("settings.json");
             let settings = Settings::load(&settings_path);
             let svc = Service::new(
-                windows_rules(),
+                if IS_MAC { mac_rules() } else { windows_rules() },
                 Env::from_process(),
                 Box::new(windows_policy),
                 fast_scan(),
@@ -619,6 +741,15 @@ pub fn run() {
                 data_dir.join("migrations.json"),
                 Arc::new(diskclean_core::sysaction::SystemRunner),
             ));
+            let svc = if IS_MAC {
+                svc.with_mac(service::MacConfig {
+                    home: mac_home().unwrap_or_default(),
+                    app_roots: diskclean_core::macapps::app_roots(&mac_home().unwrap_or_default()),
+                    trash: Arc::new(diskclean_core::macapps::move_to_trash),
+                })
+            } else {
+                svc
+            };
             // 上次被中断的迁移：根据磁盘上的实际状态回滚或补记完成。
             let _ = svc.mig_recover();
             app.manage(AppState {
@@ -662,6 +793,7 @@ pub fn run() {
             mig_list,
             mig_restore,
             app_status,
+            open_privacy_settings,
             relaunch_as_admin,
             settings_get,
             settings_set_exclusions,

@@ -231,8 +231,22 @@ impl Copier for RobocopyCopier {
         on_bytes: &mut dyn FnMut(u64),
     ) -> io::Result<CopyStats> {
         let mut cmd = std::process::Command::new("robocopy.exe");
-        cmd.args(robocopy_args(src, dst))
-            .stdout(std::process::Stdio::null())
+        cmd.args(robocopy_args(src, dst));
+        run_external_copy(cmd, dst, cancel, on_bytes, "robocopy", robocopy_exit_ok)
+    }
+}
+
+/// 运行外部复制命令：期间抽样统计目标目录以报告进度，被取消时终止进程，最后按 `ok` 判断退出码。
+fn run_external_copy(
+    mut cmd: std::process::Command,
+    dst: &Path,
+    cancel: &AtomicBool,
+    on_bytes: &mut dyn FnMut(u64),
+    name: &str,
+    ok: fn(i32) -> bool,
+) -> io::Result<CopyStats> {
+    {
+        cmd.stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         #[cfg(windows)]
         {
@@ -261,9 +275,9 @@ impl Copier for RobocopyCopier {
             std::thread::sleep(Duration::from_millis(200));
         };
         let code = status.code().unwrap_or(-1);
-        if !robocopy_exit_ok(code) {
+        if !ok(code) {
             return Err(io::Error::other(format!(
-                "robocopy failed with exit code {code}"
+                "{name} failed with exit code {code}"
             )));
         }
         let size = crate::plan::measure_path(dst).map_err(|e| io::Error::other(e.to_string()))?;
@@ -272,6 +286,31 @@ impl Copier for RobocopyCopier {
             files: size.files,
             bytes: size.size,
         })
+    }
+}
+
+/// macOS 自带的 `ditto`：保留权限、所有者、扩展属性、ACL、资源分支和目录内的符号链接。
+/// `ditto 源 目标` 把源目录的**内容**复制进目标目录（不存在则创建）。
+pub struct DittoCopier;
+
+pub fn ditto_args(src: &Path, dst: &Path) -> Vec<String> {
+    vec![
+        src.to_string_lossy().into_owned(),
+        dst.to_string_lossy().into_owned(),
+    ]
+}
+
+impl Copier for DittoCopier {
+    fn copy_tree(
+        &self,
+        src: &Path,
+        dst: &Path,
+        cancel: &AtomicBool,
+        on_bytes: &mut dyn FnMut(u64),
+    ) -> io::Result<CopyStats> {
+        let mut cmd = std::process::Command::new("/usr/bin/ditto");
+        cmd.args(ditto_args(src, dst));
+        run_external_copy(cmd, dst, cancel, on_bytes, "ditto", |c| c == 0)
     }
 }
 
@@ -339,6 +378,26 @@ pub fn remove_link(link: &Path) -> io::Result<()> {
     match fs::remove_dir(link) {
         Ok(()) => Ok(()),
         Err(_) => fs::remove_file(link),
+    }
+}
+
+/// 用符号链接代替 junction（macOS）。不经过命令解释器，路径里的任何字符都是安全的。
+#[cfg(unix)]
+pub struct SymlinkMaker;
+
+#[cfg(unix)]
+impl LinkMaker for SymlinkMaker {
+    fn make_junction(&self, link: &Path, target: &Path) -> io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    fn remove_link(&self, link: &Path) -> io::Result<()> {
+        // 符号链接本身是文件：用 remove_file，绝不会进入目标目录。
+        fs::remove_file(link)
+    }
+
+    fn link_target(&self, link: &Path) -> Option<PathBuf> {
+        fs::read_link(link).ok()
     }
 }
 
@@ -465,6 +524,63 @@ impl ManifestStore {
 // ====================================================================
 // 安全策略
 // ====================================================================
+
+/// macOS 的迁移策略：系统目录整体禁止；`/Applications`、用户主目录、`Library`、
+/// `Application Support`、文档/桌面/下载等**目录本身**禁止，但里面的子目录允许
+/// （迁移 `Xcode.app`、`~/Library/Developer`、`~/Library/Application Support/MobileSync` 正是典型用途）；
+/// 系统与同步相关的 `Library` 子目录（偏好设置、钥匙串、iCloud、容器、邮件等）重新保护。
+pub fn mac_migration_policy(home: &str) -> Result<SafetyPolicy, crate::safety::Denied> {
+    use crate::safety::PathStyle;
+    let mut p = SafetyPolicy::empty(PathStyle::Mac);
+    for d in [
+        "/System", "/usr", "/bin", "/sbin", "/etc", "/var", "/private", "/Library", "/opt",
+        "/cores", "/Volumes", "/dev",
+    ] {
+        p.protect(d)?;
+    }
+    let home = home.trim_end_matches('/').to_string();
+    let mut open_roots = vec!["/Applications".to_string(), home.clone()];
+    for sub in [
+        "Library",
+        "Library/Application Support",
+        "Library/Caches",
+        "Documents",
+        "Desktop",
+        "Downloads",
+        "Pictures",
+        "Movies",
+        "Music",
+    ] {
+        open_roots.push(format!("{home}/{sub}"));
+    }
+    for r in &open_roots {
+        p.protect(r)?;
+        p.allow_root(r)?;
+    }
+    for c in [
+        "Library/Preferences",
+        "Library/Keychains",
+        "Library/Mobile Documents",
+        "Library/CloudStorage",
+        "Library/Containers",
+        "Library/Group Containers",
+        "Library/Mail",
+        "Library/Messages",
+        "Library/Safari",
+        "Library/Accounts",
+        "Library/Cookies",
+        "Library/LaunchAgents",
+        "Library/Saved Application State",
+        "Library/Application Support/AddressBook",
+        "Library/Application Support/CloudDocs",
+        "Library/Application Support/com.apple.TCC",
+        ".Trash",
+    ] {
+        p.protect(&format!("{home}/{c}"))?;
+    }
+    p.protect("/Applications/Utilities")?;
+    Ok(p)
+}
 
 /// 迁移用的安全策略：决定**哪些目录可以被搬走**（搬走后原位置会被删除/替换）。
 ///
@@ -598,6 +714,10 @@ pub struct PreflightOptions {
     pub program_dirs: Vec<PathBuf>,
     /// 云同步目录的识别规则。云同步目录不能迁移：搬走会破坏同步。
     pub cloud: crate::cloud::CloudRules,
+    /// macOS 风格：用符号链接代替 junction。此时路径不经命令解释器（`&`、`%` 等字符合法），
+    /// 任何本地文件系统都能创建符号链接，目录内部的符号链接会被原样复制；外置磁盘是最常见的
+    /// 目标，只给出提示；目标卷必须是 APFS 或 HFS+，否则权限与扩展属性会丢失。
+    pub unix_links: bool,
 }
 
 #[derive(Debug, Default)]
@@ -666,7 +786,7 @@ pub fn preflight(
     for (path, which) in [(src, "source"), (dst, "target")] {
         let s = path.to_string_lossy();
         if !path.is_absolute() && !s.starts_with('/') && !s.chars().nth(1).is_some_and(|c| c == ':')
-            || !shell_safe(path)
+            || (!opts.unix_links && !shell_safe(path))
         {
             p.issues.push(Issue::err("invalid_path", which.to_string()));
         }
@@ -733,13 +853,26 @@ pub fn preflight(
                 p.issues.push(Issue::err("target_remote", None));
             }
             if t.removable {
-                p.issues.push(Issue::err("target_removable", None));
+                p.issues.push(if opts.unix_links {
+                    Issue::warn("target_removable", None)
+                } else {
+                    Issue::err("target_removable", None)
+                });
             }
-            // junction 要求源所在卷是 NTFS（或 ReFS）。读不到文件系统名时不阻止。
-            let fs_name = s.fs.to_lowercase();
-            if !fs_name.is_empty() && fs_name != "ntfs" && fs_name != "refs" {
-                p.issues
-                    .push(Issue::err("source_fs_unsupported", s.fs.clone()));
+            if opts.unix_links {
+                // 复制到 exFAT/FAT/NTFS 会丢失权限、扩展属性与资源分支，应用和数据可能无法再使用。
+                let fs_name = t.fs.to_lowercase();
+                if !fs_name.is_empty() && !fs_name.contains("apfs") && !fs_name.contains("hfs") {
+                    p.issues
+                        .push(Issue::err("target_fs_unsupported", t.fs.clone()));
+                }
+            } else {
+                // junction 要求源所在卷是 NTFS（或 ReFS）。读不到文件系统名时不阻止。
+                let fs_name = s.fs.to_lowercase();
+                if !fs_name.is_empty() && fs_name != "ntfs" && fs_name != "refs" {
+                    p.issues
+                        .push(Issue::err("source_fs_unsupported", s.fs.clone()));
+                }
             }
         }
         _ => p.issues.push(Issue::err("volume_unknown", None)),
@@ -755,7 +888,7 @@ pub fn preflight(
         let sv = survey(src);
         p.size = sv.size;
         p.files = sv.files;
-        if sv.link_count > 0 {
+        if sv.link_count > 0 && !opts.unix_links {
             p.issues.push(Issue::err(
                 "contains_links",
                 format!("{} ({})", sv.link_count, sv.links.join(", ")),
@@ -2476,5 +2609,98 @@ mod tests {
             (v["op"].as_str(), v["event"].as_str(), v["status"].as_str()),
             (Some("migration"), Some("done"), Some("done"))
         );
+    }
+
+    // ----- macOS -----
+
+    #[test]
+    fn mac_policy_allows_apps_and_developer_data_but_not_the_system_or_sync_folders() {
+        let p = mac_migration_policy("/Users/alice").unwrap();
+        for ok in [
+            "/Applications/Xcode.app",
+            "/Users/alice/Library/Developer",
+            "/Users/alice/Library/Application Support/MobileSync",
+            "/Users/alice/Library/Application Support/Slack",
+            "/Users/alice/Movies/Projects",
+            "/Users/alice/dev/big-repo",
+        ] {
+            assert!(p.check_delete(ok).is_ok(), "{ok} should be movable");
+        }
+        for bad in [
+            "/Applications",
+            "/Applications/Utilities",
+            "/System/Library",
+            "/Library/Developer",
+            "/Users/alice",
+            "/Users/alice/Library",
+            "/Users/alice/Library/Application Support",
+            "/Users/alice/Library/Containers/com.foo",
+            "/Users/alice/Library/Mobile Documents/com~apple~CloudDocs",
+            "/Users/alice/Library/Keychains",
+            "/Users/alice/.Trash",
+            "/Users/alice/Documents",
+            "/Volumes/Backup/x",
+        ] {
+            assert!(p.check_delete(bad).is_err(), "{bad} must be refused");
+        }
+    }
+
+    #[test]
+    fn unix_links_mode_allows_ampersands_external_targets_and_inner_symlinks() {
+        let (sb, _) = setup();
+        let vols = FakeVols::new(&sb);
+        let policy = SafetyPolicy::empty(crate::safety::native_style());
+        let src = sb.base.join("A & B");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("data.bin"), vec![0u8; 100]).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("data.bin", src.join("alias")).unwrap();
+        let dst = sb.base.join("D/A & B");
+        let strict = preflight(
+            &src,
+            &dst,
+            &vols,
+            &policy,
+            &[],
+            &PreflightOptions::default(),
+        );
+        assert!(strict.issues.iter().any(|i| i.code == "invalid_path"));
+        let mac = PreflightOptions {
+            unix_links: true,
+            ..PreflightOptions::default()
+        };
+        let p = preflight(&src, &dst, &vols, &policy, &[], &mac);
+        assert!(!p.issues.iter().any(|i| matches!(
+            i.code,
+            "invalid_path" | "contains_links" | "source_fs_unsupported"
+        )));
+    }
+
+    #[test]
+    fn ditto_is_called_with_plain_arguments() {
+        assert_eq!(
+            ditto_args(
+                Path::new("/Users/a/Library/X & Y"),
+                Path::new("/Volumes/E/X & Y")
+            ),
+            ["/Users/a/Library/X & Y", "/Volumes/E/X & Y"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_maker_links_and_unlinks_without_touching_the_target() {
+        let (sb, _) = setup();
+        let target = sb.base.join("moved");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("f"), b"x").unwrap();
+        let link = sb.base.join("orig");
+        let m = SymlinkMaker;
+        m.make_junction(&link, &target).unwrap();
+        assert_eq!(m.link_target(&link).as_deref(), Some(target.as_path()));
+        assert_eq!(std::fs::read(link.join("f")).unwrap(), b"x");
+        m.remove_link(&link).unwrap();
+        assert!(!link.exists());
+        assert!(target.join("f").exists());
     }
 }

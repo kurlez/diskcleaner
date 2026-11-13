@@ -3,6 +3,7 @@
   import { formatDuration, formatSize } from '../lib/format';
   import { errorText, t } from '../lib/i18n.svelte';
   import { nav } from '../lib/nav.svelte';
+  import { platform } from '../lib/platform.svelte';
   import TreeNode from '../components/TreeNode.svelte';
   import Treemap from '../components/Treemap.svelte';
   import PieChart from '../components/PieChart.svelte';
@@ -16,6 +17,11 @@
   import type { Child, ScanProgress, ScanSummary } from '../lib/types';
 
   let path = $state(nav.scanPath);
+  let pathEdited = false;
+  // 平台检测完成后（macOS 默认分析主目录）更新默认路径；用户改过就不再覆盖。
+  $effect(() => {
+    if (platform.ready && !pathEdited && !scanning) path = nav.scanPath;
+  });
   let scanning = $state(false);
   let progress = $state<ScanProgress | null>(null);
   let elapsed = $state(0);
@@ -96,7 +102,7 @@
 <form class="row bar-row" onsubmit={(e) => { e.preventDefault(); start(); }}>
   <label class="grow row">
     <span class="muted">{t('scan.path')}</span>
-    <input type="text" class="grow" bind:value={path} placeholder={t('scan.pathPlaceholder')} disabled={scanning} spellcheck="false" />
+    <input type="text" class="grow" bind:value={path} oninput={() => (pathEdited = true)} placeholder={t('scan.pathPlaceholder')} disabled={scanning} spellcheck="false" />
   </label>
   <label class="row" title={t('scan.minSizeHint')}>
     <span class="muted">{t('scan.minSize')}</span>

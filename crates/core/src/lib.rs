@@ -4,6 +4,7 @@ pub mod builtin;
 pub mod cleaner;
 pub mod cloud;
 pub mod duplicates;
+pub mod macapps;
 pub mod mft;
 pub mod migrate;
 pub mod plan;

@@ -4,6 +4,7 @@
   import { formatSize } from '../lib/format';
   import { errorText, t } from '../lib/i18n.svelte';
   import { goMigrate } from '../lib/nav.svelte';
+  import { isMac } from '../lib/platform.svelte';
   import { afterChange } from '../lib/refresh.svelte';
   import Icon from '../components/Icon.svelte';
   import { iconKind, type IconKind } from '../lib/fileicon';
@@ -44,7 +45,7 @@
     const q = query.trim().toLowerCase();
     const list = apps.filter(
       (a) =>
-        (tab === 'all' || a.kind === tab) &&
+        (tab === 'all' || a.kind === tab || (tab === 'desktop' && a.kind === 'bundle')) &&
         (!q || a.name.toLowerCase().includes(q) || (a.publisher ?? '').toLowerCase().includes(q)),
     );
     const by: Record<typeof sort, (a: AppInfo, b: AppInfo) => number> = {
@@ -167,7 +168,7 @@
   <div class="row filters">
     <input type="text" class="grow" placeholder={t('un.search')} bind:value={query} aria-label={t('un.search')} />
     <div class="row seg" role="group">
-      {#each [['all', 'un.tab.all'], ['desktop', 'un.tab.desktop'], ['store', 'un.tab.store']] as [k, label]}
+      {#each (isMac() ? [['all', 'un.tab.all']] : [['all', 'un.tab.all'], ['desktop', 'un.tab.desktop'], ['store', 'un.tab.store']]) as [k, label]}
         <button class:primary={tab === k} aria-pressed={tab === k} onclick={() => (tab = k as typeof tab)}>{t(label)}</button>
       {/each}
     </div>
@@ -202,10 +203,10 @@
           {:else}
             <span class="muted small">{t('un.noInstaller')}</span>
           {/if}
-          {#if a.kind === 'desktop' && a.install_location}
+          {#if (a.kind === 'desktop' || a.kind === 'bundle') && a.install_location}
             <button onclick={() => goMigrate(a.install_location!)}>{t('un.migrate')}</button>
           {/if}
-          {#if a.kind === 'desktop'}<button onclick={() => pick(a, true)}>{t('un.force')}</button>{/if}
+          {#if a.kind === 'desktop' || a.kind === 'bundle'}<button onclick={() => pick(a, true)}>{t('un.force')}</button>{/if}
         </li>
       {/each}
     </ul>
@@ -215,6 +216,9 @@
     <h2>{t('un.confirmTitle', { name: current.name })}</h2>
     {#if current.kind === 'store'}
       <p>{t('un.willRunStore')}</p>
+    {:else if current.kind === 'bundle'}
+      <p>{t('un.willTrash')}</p>
+      <pre class="mono cmd">{current.install_location}</pre>
     {:else}
       <p>{t('un.willRun')}</p>
       <pre class="mono cmd">{current.uninstall_command}</pre>

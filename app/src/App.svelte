@@ -9,8 +9,11 @@
   import Clean from './views/Clean.svelte';
   import SettingsView from './views/Settings.svelte';
   import AdminBanner from './components/AdminBanner.svelte';
+  import { loadPlatform } from './lib/platform.svelte';
+  import { onMount } from 'svelte';
 
   setLocale(i18n.locale);
+  onMount(loadPlatform);
 
   const items: { view: View; key: string; icon: string }[] = [
     { view: 'dashboard', key: 'nav.dashboard', icon: 'M3 12l9-8 9 8M5 10v10h5v-6h4v6h5V10' },

@@ -202,7 +202,18 @@ export const mockApi: Api = {
     return rep;
   },
   async cleanCancel() { cancelClean = true; },
-  async appStatus() { return { elevated: (window as any).__mockElevated ?? false }; },
+  // 浏览器里预览 macOS 界面：在地址后加 ?platform=mac（`?fda=1` 表示已授予完全磁盘访问权限）。
+  async appStatus() {
+    const q = new URLSearchParams(location.search);
+    const mac = q.get('platform') === 'mac';
+    return {
+      elevated: mac ? true : ((window as any).__mockElevated ?? false),
+      platform: mac ? 'macos' as const : 'windows' as const,
+      home: mac ? '/Users/alice' : 'C:\\Users\\alice',
+      full_disk_access: mac ? q.get('fda') === '1' : null,
+    };
+  },
+  async openPrivacySettings() {},
   async relaunchAsAdmin() { if ((window as any).__mockUacCancel) throw { code: 'uac_cancelled' }; (window as any).__mockElevated = true; },
   async settingsGet(): Promise<Settings> { return { exclusions, analyze_cloud: analyzeCloud, skip_paths: skipPaths }; },
   async settingsSetCloud(analyze, paths) {

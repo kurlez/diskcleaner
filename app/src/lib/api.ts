@@ -18,6 +18,7 @@ const real: Api = {
   cleanCancel: () => invoke('clean_cancel'),
   appStatus: () => invoke('app_status'),
   relaunchAsAdmin: () => invoke('relaunch_as_admin'),
+  openPrivacySettings: () => invoke('open_privacy_settings'),
   settingsGet: () => invoke('settings_get'),
   settingsSetExclusions: (exclusions) => invoke('settings_set_exclusions', { exclusions }),
   settingsSetCloud: (analyzeCloud, skipPaths) => invoke('settings_set_cloud', { analyzeCloud, skipPaths }),

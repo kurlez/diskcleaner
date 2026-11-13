@@ -33,12 +33,37 @@ describe('driveOf / parseSpace', () => {
   it('extracts the drive letter', () => {
     expect(driveOf('d:\\x')).toBe('D');
     expect(driveOf('\\\\?\\E:\\x')).toBe('E');
-    expect(driveOf('/tmp')).toBeNull();
+    expect(driveOf('relative\\x')).toBeNull();
   });
 
   it('parses the need/have detail', () => {
     expect(parseSpace('1000/10')).toEqual({ need: 1000, have: 10 });
     expect(parseSpace('x')).toBeNull();
     expect(parseSpace(null)).toBeNull();
+  });
+});
+
+describe('macOS paths', () => {
+  it('suggests a mirrored target on the chosen volume', () => {
+    expect(suggestTarget('/Users/alice/Library/Developer', '/Volumes/External')).toBe(
+      '/Volumes/External/DiskClean-Migrated/Users/alice/Library/Developer',
+    );
+    expect(suggestTarget('/Applications/Xcode.app/', '/Volumes/Big SSD/')).toBe(
+      '/Volumes/Big SSD/DiskClean-Migrated/Applications/Xcode.app',
+    );
+    // 源在外置卷上：去掉卷名，保留卷内的相对路径。
+    expect(suggestTarget('/Volumes/Old/Projects/x', '/Volumes/New')).toBe('/Volumes/New/DiskClean-Migrated/Projects/x');
+    expect(suggestTarget('relative/path', '/Volumes/X')).toBe('');
+    expect(suggestTarget('/Users/a', 'D:\\')).toBe('');
+    expect(suggestTarget('/', '/Volumes/X')).toBe('');
+  });
+
+  it('tells volumes apart', () => {
+    expect(driveOf('/Users/alice')).toBe('/');
+    expect(driveOf('/')).toBe('/');
+    expect(driveOf('/Volumes/Big SSD/Stuff')).toBe('/Volumes/Big SSD');
+    expect(driveOf('/Volumes/Big SSD')).toBe('/Volumes/Big SSD');
+    expect(cleanPath('/Users/alice/')).toBe('/Users/alice');
+    expect(cleanPath('C:/a/b/')).toBe('C:\\a\\b');
   });
 });

@@ -12,6 +12,13 @@ export interface ScanSummary {
   cancelled: boolean; elapsed_ms: number; min_size: number; top_files: FileEntry[];
 }
 export interface Child { name: string; size: number; is_dir: boolean; file_count: number }
+export interface AppStatus {
+  elevated: boolean;
+  platform: 'windows' | 'macos' | 'other';
+  home: string;
+  /** macOS：是否已授予"完全磁盘访问权限"；其他平台为 null。 */
+  full_disk_access: boolean | null;
+}
 export interface Children { items: Child[]; hidden: number; small_size: number; small_files: number }
 export interface Rule { id: string; risk: Risk; default_selected: boolean; disposal: Disposal }
 export interface RuleTotal { rule_id: string; size: number; files: number }
@@ -46,7 +53,7 @@ export interface SysResult { id: string; free_before: number | null; free_after:
 export interface AppInfo {
   id: number; name: string; version: string | null; publisher: string | null;
   install_date: string | null; size_kb: number | null; install_location: string | null;
-  kind: 'desktop' | 'store'; can_uninstall: boolean; uninstall_command: string | null;
+  kind: 'desktop' | 'store' | 'bundle'; can_uninstall: boolean; uninstall_command: string | null;
 }
 export interface UninstallRun { exit_code: number; still_registered: boolean }
 export interface Leftover {
@@ -95,7 +102,8 @@ export interface Api {
   planDiscard(): Promise<void>;
   planExecute(dryRun: boolean, recycle: boolean): Promise<Report>;
   cleanCancel(): Promise<void>;
-  appStatus(): Promise<{ elevated: boolean }>;
+  appStatus(): Promise<AppStatus>;
+  openPrivacySettings(): Promise<void>;
   relaunchAsAdmin(): Promise<void>;
   settingsGet(): Promise<Settings>;
   settingsSetExclusions(exclusions: string[]): Promise<Settings>;

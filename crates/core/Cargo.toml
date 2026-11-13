@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 rayon = "1"
+plist = "1"
 blake3 = "1.8.7"
 ntfs = "0.4.0"
 same-file = "1.0.6"

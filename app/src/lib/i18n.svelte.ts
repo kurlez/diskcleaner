@@ -1,5 +1,6 @@
 import { en } from './locales/en';
 import { zh } from './locales/zh';
+import { platform } from './platform.svelte';
 import type { ApiError } from './types';
 
 export type Locale = 'zh' | 'en';
@@ -30,7 +31,13 @@ export function setLocale(l: Locale) {
 /** 翻译；缺失的键回退到另一种语言，再回退到键名本身。 */
 export function t(key: string, params: Record<string, string | number> = {}): string {
   const other: Locale = i18n.locale === 'zh' ? 'en' : 'zh';
-  const raw = dicts[i18n.locale][key] ?? dicts[other][key] ?? key;
+  // macOS 下优先用 `key.mac` 的文案（路径示例、"访达"、"废纸篓"等）。
+  const macKey = platform.name === 'macos' ? `${key}.mac` : '';
+  const raw =
+    (macKey && (dicts[i18n.locale][macKey] ?? dicts[other][macKey])) ||
+    dicts[i18n.locale][key] ||
+    dicts[other][key] ||
+    key;
   return raw.replace(/\{(\w+)\}/g, (m, k) => (k in params ? String(params[k]) : m));
 }
 

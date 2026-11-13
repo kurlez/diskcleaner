@@ -106,6 +106,78 @@ impl OpenFileFinder for NoOpenFileFinder {
     }
 }
 
+/// 解析 `lsof -F pcn` 的输出：`p` 行是 PID，`c` 行是命令名，`n` 行是文件名（这里不需要）。
+/// 同一个进程可能因多个文件或线程重复出现，按 PID 去重。
+pub fn parse_lsof(output: &str) -> Vec<RmProc> {
+    let mut procs: Vec<RmProc> = Vec::new();
+    let mut cur: Option<RmProc> = None;
+    let flush = |c: Option<RmProc>, procs: &mut Vec<RmProc>| {
+        if let Some(c) = c {
+            if !procs.iter().any(|p| p.pid == c.pid) {
+                procs.push(c);
+            }
+        }
+    };
+    for line in output.lines() {
+        let (tag, rest) = line.split_at(line.chars().next().map_or(0, char::len_utf8));
+        match tag {
+            "p" => {
+                flush(cur.take(), &mut procs);
+                if let Ok(pid) = rest.trim().parse::<u32>() {
+                    cur = Some(RmProc {
+                        pid,
+                        name: String::new(),
+                        service: None,
+                        kind: RmKind::Application,
+                    });
+                }
+            }
+            "c" => {
+                if let Some(c) = cur.as_mut() {
+                    c.name = rest.to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    flush(cur.take(), &mut procs);
+    procs
+}
+
+/// macOS：用 `lsof` 查询哪些进程打开了这些文件。
+pub struct LsofFinder(pub std::sync::Arc<dyn CommandRunner>);
+
+impl OpenFileFinder for LsofFinder {
+    fn processes_using(&self, files: &[PathBuf]) -> io::Result<Vec<RmProc>> {
+        /// 每次调用传给 lsof 的文件数（命令行长度有上限）。
+        const BATCH: usize = 200;
+        let mut found: Vec<RmProc> = Vec::new();
+        for chunk in files.chunks(BATCH) {
+            let paths: Vec<String> = chunk
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            let mut args: Vec<&str> = vec!["-F", "pc", "--"];
+            args.extend(paths.iter().map(String::as_str));
+            let out = self.0.run("/usr/sbin/lsof", &args)?;
+            // lsof 没找到任何打开者时退出码为 1、输出为空，这是正常结果。
+            if out.code != 0 && out.code != 1 {
+                return Err(io::Error::other(format!(
+                    "lsof exited with {}: {}",
+                    out.code,
+                    out.stderr.trim()
+                )));
+            }
+            for p in parse_lsof(&out.stdout) {
+                if !found.iter().any(|f| f.pid == p.pid) {
+                    found.push(p);
+                }
+            }
+        }
+        Ok(found)
+    }
+}
+
 #[cfg(windows)]
 pub use rm::RestartManager;
 
@@ -331,6 +403,30 @@ const CRITICAL: &[&str] = &[
     "securityhealthservice.exe",
     "sihost.exe",
     "ctfmon.exe",
+    // macOS
+    "launchd",
+    "kernel_task",
+    "windowserver",
+    "loginwindow",
+    "systemuiserver",
+    "dock",
+    "coreservicesd",
+    "launchservicesd",
+    "opendirectoryd",
+    "configd",
+    "cfprefsd",
+    "securityd",
+    "trustd",
+    "mds",
+    "mds_stores",
+    "diskarbitrationd",
+    "fseventsd",
+    "notifyd",
+    "logd",
+    "powerd",
+    "coreaudiod",
+    "bluetoothd",
+    "hidd",
 ];
 
 fn protection_of(p: &ProcInfo, self_pid: u32) -> Option<Protection> {
@@ -339,7 +435,7 @@ fn protection_of(p: &ProcInfo, self_pid: u32) -> Option<Protection> {
         Some(Protection::ThisApp)
     } else if p.pid <= 4 || CRITICAL.contains(&n.as_str()) {
         Some(Protection::Critical)
-    } else if n == "explorer.exe" {
+    } else if n == "explorer.exe" || n == "finder" {
         Some(Protection::Explorer)
     } else {
         None
@@ -702,6 +798,40 @@ fn wait_gone(procs: &dyn ProcessSource, step: &StopStep, total: Duration, poll: 
     }
 }
 
+/// 结束进程用的命令：Windows 用 `taskkill`，macOS 用 `kill`（SIGTERM → SIGKILL）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopCommands {
+    Windows,
+    Unix,
+}
+
+impl StopCommands {
+    pub fn for_platform() -> Self {
+        if cfg!(windows) {
+            StopCommands::Windows
+        } else if cfg!(target_os = "macos") {
+            StopCommands::Unix
+        } else {
+            // 其他平台没有受支持的前端，沿用原行为；测试依赖这一点。
+            StopCommands::Windows
+        }
+    }
+
+    pub fn graceful(self, pid: &str) -> (&'static str, Vec<String>) {
+        match self {
+            StopCommands::Windows => ("taskkill.exe", vec!["/PID".into(), pid.into()]),
+            StopCommands::Unix => ("/bin/kill", vec!["-TERM".into(), pid.into()]),
+        }
+    }
+
+    pub fn force(self, pid: &str) -> (&'static str, Vec<String>) {
+        match self {
+            StopCommands::Windows => ("taskkill.exe", vec!["/PID".into(), pid.into(), "/F".into()]),
+            StopCommands::Unix => ("/bin/kill", vec!["-KILL".into(), pid.into()]),
+        }
+    }
+}
+
 /// 执行停止计划。`force` 为真时，礼貌关闭超时后再强制结束。
 ///
 /// 每一步之前都会重新确认"这个 PID 还是当初那个进程"（PID、启动时间、名称都一致），
@@ -734,8 +864,10 @@ pub fn execute_stop(
             continue;
         }
         let pid = step.pid.to_string();
-        // 礼貌地请求关闭（向窗口发送关闭消息）。
-        let _ = runner.run("taskkill.exe", &["/PID", &pid]);
+        let cmds = StopCommands::for_platform();
+        // 礼貌地请求关闭（Windows 向窗口发送关闭消息；macOS 发送 SIGTERM）。
+        let (prog, args) = cmds.graceful(&pid);
+        let _ = runner.run(prog, &args.iter().map(String::as_str).collect::<Vec<_>>());
         if wait_gone(procs, step, timing.graceful_wait, timing.poll) {
             out.push(mk(StopStatus::Exited));
             continue;
@@ -749,7 +881,8 @@ pub fn execute_stop(
             out.push(mk(StopStatus::Exited));
             continue;
         }
-        match runner.run("taskkill.exe", &["/PID", &pid, "/F"]) {
+        let (prog, args) = cmds.force(&pid);
+        match runner.run(prog, &args.iter().map(String::as_str).collect::<Vec<_>>()) {
             Ok(_) if wait_gone(procs, step, timing.force_wait, timing.poll) => {
                 out.push(mk(StopStatus::Forced))
             }
@@ -1439,5 +1572,80 @@ mod tests {
             .expect("current process must be listed");
         assert!(mine.start_time > 0);
         assert!(mine.exe.is_some());
+    }
+
+    // ----- macOS -----
+
+    #[test]
+    fn lsof_output_is_parsed_and_deduplicated() {
+        let out = "p501\ncSlack\np501\ncSlack\np733\ncXcode Helper\nn/x\n";
+        let v = parse_lsof(out);
+        assert_eq!(v.len(), 2);
+        assert_eq!((v[0].pid, v[0].name.as_str()), (501, "Slack"));
+        assert_eq!((v[1].pid, v[1].name.as_str()), (733, "Xcode Helper"));
+        assert!(parse_lsof("").is_empty());
+        assert!(parse_lsof("pnotanumber\ncX\n").is_empty());
+    }
+
+    struct LsofFake(Mutex<Vec<String>>, i32, &'static str);
+    impl CommandRunner for LsofFake {
+        fn run(&self, program: &str, args: &[&str]) -> io::Result<CmdOutput> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{program} {}", args.join(" ")));
+            Ok(CmdOutput {
+                code: self.1,
+                stdout: self.2.into(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn lsof_finder_batches_files_and_treats_exit_1_as_nobody() {
+        let fake = std::sync::Arc::new(LsofFake(Mutex::default(), 0, "p42\ncFoo\n"));
+        let finder = LsofFinder(fake.clone());
+        let files: Vec<PathBuf> = (0..450)
+            .map(|i| PathBuf::from(format!("/d/f {i}")))
+            .collect();
+        let found = finder.processes_using(&files).unwrap();
+        assert_eq!(found.len(), 1, "三批的结果按 PID 合并");
+        let calls = fake.0.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert!(calls[0].starts_with("/usr/sbin/lsof -F pc -- /d/f 0 "));
+
+        let none = LsofFinder(std::sync::Arc::new(LsofFake(Mutex::default(), 1, "")));
+        assert!(none.processes_using(&files[..1]).unwrap().is_empty());
+        let bad = LsofFinder(std::sync::Arc::new(LsofFake(Mutex::default(), 2, "")));
+        assert!(bad.processes_using(&files[..1]).is_err());
+    }
+
+    #[test]
+    fn unix_stop_uses_kill_signals_and_finder_is_protected() {
+        assert_eq!(
+            StopCommands::Unix.graceful("42"),
+            ("/bin/kill", vec!["-TERM".to_string(), "42".to_string()])
+        );
+        assert_eq!(
+            StopCommands::Unix.force("42"),
+            ("/bin/kill", vec!["-KILL".to_string(), "42".to_string()])
+        );
+        assert_eq!(StopCommands::Windows.graceful("7").0, "taskkill.exe");
+        let finder = p(
+            300,
+            Some(1),
+            "Finder",
+            Some("/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"),
+            None,
+        );
+        assert_eq!(protection_of(&finder, 1), Some(Protection::Explorer));
+        let launchd = p(1, None, "launchd", Some("/sbin/launchd"), None);
+        assert_eq!(protection_of(&launchd, 999), Some(Protection::Critical));
+        let window_server = p(150, Some(1), "WindowServer", None, None);
+        assert_eq!(
+            protection_of(&window_server, 999),
+            Some(Protection::Critical)
+        );
     }
 }

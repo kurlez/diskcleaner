@@ -202,3 +202,24 @@
 - **设置**：可打开"也分析云端硬盘和同步目录"；可添加额外要跳过的完整路径（无论是否分析云端都生效，无效路径会被拒绝而不是静默无效）。
 - 注意：群晖 Drive 等私有云的本地同步目录里是**真实占用本机空间的副本**，默认也被排除；
   想看它们占了多少，在设置里打开"分析云端"即可。
+
+## macOS 支持（v0.2）
+
+目标：macOS 11+（Apple 芯片与 Intel，通用二进制）。核心库与 UI 复用，平台差异用依赖注入隔离，
+所以绝大部分逻辑可以在 Linux 上以 `PathStyle::Mac` 做集成测试。
+
+| 能力 | Windows | macOS |
+| --- | --- | --- |
+| 路径安全 | `PathStyle::Windows`（盘符、大小写不敏感） | `PathStyle::Mac`（`/`、大小写不敏感）；保护 `/System`、`/usr`、`/Library`、`/Applications`、主目录及文档类目录，`~/Library` 整体保护，缓存等由规则逐个放开 |
+| 磁盘分析 | MFT 快速扫描，失败回退遍历 | 并行遍历，大小取实际占用（`st_blocks`）；跳过 `/System/Volumes`、`/Volumes`、`/dev`、交换文件，避免重复计数；默认分析主目录 |
+| 清理规则 | `%TEMP%` 等 | `%HOME%/Library/Caches`、`Logs`、浏览器缓存、废纸篓、Xcode、开发缓存、iOS 备份（默认只勾选低风险项） |
+| 系统工具 | 回收站、休眠、DISM、`Windows.old`、卷影副本 | Time Machine 本地快照（经系统授权对话框）、`brew cleanup`、删除不可用的 iOS 模拟器 |
+| 应用卸载 | 注册表 + 卸载器，残留含注册表项 | 枚举 `/Applications` 与 `~/Applications` 的 `.app`；卸载 = 移入废纸篓；残留在 `~/Library` 的固定子目录里按 **Bundle ID（高）/ 应用名（中）** 精确匹配，苹果自己的应用不提供清理 |
+| 目录迁移 | junction + robocopy | 符号链接 + `ditto`（保留权限、扩展属性、资源分支与内部符号链接）；外置磁盘只提示；目标必须是 APFS/HFS+；路径不经命令解释器 |
+| 占用检测 | Restart Manager + 进程 cwd/exe | `lsof` + 进程 cwd/exe；结束进程用 SIGTERM → SIGKILL，`Finder`、`WindowServer`、`launchd` 等受保护 |
+| 云盘排除 | OneDrive 等目录名与环境变量 | 另加 `~/Library/Mobile Documents`（iCloud）与 `~/Library/CloudStorage/*`（文件提供程序） |
+| 权限 | 管理员 manifest；非管理员时提示重新启动 | 不需要 root；缺少“完全磁盘访问权限”时提示并一键打开系统设置 |
+| 显示 | 资源管理器、回收站 | 访达（`open -R`）、废纸篓；文案用 `key.mac` 覆盖 |
+
+已知限制：APFS 克隆文件会被分别计数；`~/Library/Containers` 等沙盒与同步目录不允许迁移；
+未公证的 .dmg 需要用户手动放行（见 docs/release.md）。

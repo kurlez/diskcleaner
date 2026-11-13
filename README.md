@@ -1,6 +1,6 @@
 # DiskClean
 
-Windows 磁盘清理工具：Rust 核心 + Tauri 2 桌面界面 + Svelte 前端，中英双语，发布版以管理员权限运行。
+磁盘清理工具（Windows 与 macOS）：Rust 核心 + Tauri 2 桌面界面 + Svelte 前端，中英双语。Windows 发布版以管理员权限运行；macOS 版不需要管理员，建议授予“完全磁盘访问权限”。
 需求与设计见 [docs/requirements.md](docs/requirements.md)。
 
 ## 开发
@@ -21,7 +21,19 @@ npm run tauri dev      # 开发版，不要求管理员
 npm run tauri build    # 发布版，生成 NSIS 安装包，运行时弹 UAC
 ```
 
-仅预览界面（任意平台，使用模拟数据）：
+桌面应用（macOS 11+，需要 Rust、Node 20+ 与 Xcode 命令行工具）：
+
+```bash
+cd app
+npm install
+npm run tauri dev
+npm run tauri build -- --target universal-apple-darwin   # 通用（Apple 芯片 + Intel）.dmg
+```
+
+未签名的 .dmg 下载后会被 Gatekeeper 拦截（提示“已损坏”），对 .app 执行一次：
+`xattr -cr /Applications/DiskClean.app`，或在“系统设置 → 隐私与安全性”里点“仍要打开”。
+
+仅预览界面（任意平台，使用模拟数据；地址后加 `?platform=mac` 预览 macOS 文案）：
 
 ```bash
 cd app && npm install && npm run dev

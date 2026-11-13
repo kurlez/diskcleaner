@@ -40,6 +40,8 @@ pub enum AppSource {
     Registry { hive: Hive, key: String },
     /// Microsoft Store（AppX/MSIX）应用。
     Appx { package_full_name: String },
+    /// macOS 的 `.app` 应用包。
+    MacBundle { path: PathBuf, bundle_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -297,6 +299,8 @@ pub fn run_uninstaller(
                 )
                 .map_err(|e| UninstallError::Failed(e.to_string()))?
         }
+        // macOS 应用没有卸载器：由 `macapps::uninstall_mac_bundle` 移入废纸篓。
+        AppSource::MacBundle { .. } => return Err(UninstallError::NoUninstaller),
     };
     Ok(UninstallRun {
         exit_code: out.code,
@@ -316,6 +320,8 @@ pub fn is_registered(app: &InstalledApp, reg: &dyn Registry) -> bool {
             reg.key_exists(*hive, &format!("{root}\\{key}"))
         }
         AppSource::Appx { .. } => false,
+        // 应用包还在原位就算"仍已安装"。
+        AppSource::MacBundle { path, .. } => std::fs::symlink_metadata(path).is_ok(),
     }
 }
 
@@ -474,6 +480,8 @@ pub enum Reason {
     StaleService,
     ComRegistration,
     Shortcut,
+    /// macOS：文件名正好是应用的 Bundle ID（`com.foo.Bar`）。
+    BundleId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -14,6 +14,36 @@ use std::fmt;
 /// 无论位于何处，名称命中即拒绝删除的目录/文件名（小写）。
 const PROTECTED_NAMES: &[&str] = &[".git", ".ssh", ".gnupg"];
 
+/// macOS 下无论如何都不能动的系统与应用位置。
+const MAC_SYSTEM_DIRS: &[&str] = &[
+    "/System",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/etc",
+    "/var",
+    "/private",
+    "/Library",
+    "/Applications",
+    "/opt",
+    "/cores",
+    "/Volumes",
+    "/dev",
+];
+
+/// macOS 用户主目录下默认受保护的目录（`Library` 整体受保护，缓存等由规则单独放开）。
+const MAC_PROTECTED_HOME_DIRS: &[&str] = &[
+    "Documents",
+    "Desktop",
+    "Pictures",
+    "Movies",
+    "Music",
+    "Downloads",
+    "Public",
+    "Library",
+    "Applications",
+];
+
 /// 用户配置文件下默认受保护的目录。
 const PROTECTED_PROFILE_DIRS: &[&str] = &[
     "Documents",
@@ -68,6 +98,8 @@ struct NormPath(Vec<String>);
 pub fn native_style() -> PathStyle {
     if cfg!(windows) {
         PathStyle::Windows
+    } else if cfg!(target_os = "macos") {
+        PathStyle::Mac
     } else {
         PathStyle::Posix
     }
@@ -87,12 +119,15 @@ pub fn canonical_plain(path: &std::path::Path) -> std::io::Result<std::path::Pat
     Ok(c)
 }
 
-/// 路径语法。生产环境使用 `Windows`；`Posix` 仅用于在非 Windows 平台上
-/// 对真实文件系统做集成测试，规则（受保护名称、前缀判断等）完全一致。
+/// 路径语法。生产环境在 Windows 上使用 `Windows`、在 macOS 上使用 `Mac`；
+/// `Posix`（区分大小写）仅用于在 Linux 上对真实文件系统做集成测试，规则完全一致。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathStyle {
     Windows,
     Posix,
+    /// macOS：`/` 分隔，默认的 APFS/HFS+ 不区分大小写，所以分量统一转小写比较
+    /// （区分大小写的卷上会多保护一些路径，方向是安全的）。
+    Mac,
 }
 
 impl NormPath {
@@ -100,6 +135,13 @@ impl NormPath {
         match style {
             PathStyle::Windows => Self::parse_windows(input),
             PathStyle::Posix => Self::parse_posix(input),
+            PathStyle::Mac => {
+                let mut p = Self::parse_posix(input)?;
+                for part in p.0.iter_mut().skip(1) {
+                    *part = part.to_lowercase();
+                }
+                Ok(p)
+            }
         }
     }
 
@@ -316,6 +358,32 @@ impl SafetyPolicy {
         Ok(p)
     }
 
+    /// macOS 的默认保护名单：系统目录、应用目录、用户主目录及其中的文档类目录。
+    /// 允许清理的缓存等位置由规则的目标目录（`allow_root`）逐个放开。
+    pub fn new_mac(home: &str) -> Result<Self, Denied> {
+        let mut p = SafetyPolicy::empty(PathStyle::Mac);
+        for d in MAC_SYSTEM_DIRS {
+            p.protect(d)?;
+        }
+        let home = home.trim_end_matches('/');
+        p.protect(home)?;
+        for d in MAC_PROTECTED_HOME_DIRS {
+            p.protect(&format!("{home}/{d}"))?;
+        }
+        Ok(p)
+    }
+
+    /// 用户亲自选中具体文件时的 macOS 策略（如删除重复文件）：不保护文档、桌面、下载，
+    /// 但系统目录、应用目录以及 `~/Library` 仍然拒绝。
+    pub fn for_user_selected_mac(home: &str) -> Result<Self, Denied> {
+        let mut p = SafetyPolicy::empty(PathStyle::Mac);
+        for d in MAC_SYSTEM_DIRS {
+            p.protect(d)?;
+        }
+        p.protect(&format!("{}/Library", home.trim_end_matches('/')))?;
+        Ok(p)
+    }
+
     /// 不带任何默认保护的空策略（仅用于测试或自行配置）。
     pub fn empty(style: PathStyle) -> Self {
         SafetyPolicy {
@@ -392,6 +460,80 @@ impl SafetyPolicy {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod mac_tests {
+    use super::*;
+
+    fn mac() -> SafetyPolicy {
+        let mut p = SafetyPolicy::new_mac("/Users/alice").unwrap();
+        p.allow_root("/Users/alice/Library/Caches").unwrap();
+        p.allow_root("/Users/alice/Library/Logs").unwrap();
+        p
+    }
+
+    #[test]
+    fn caches_inside_allow_roots_can_go_but_not_the_roots_or_the_rest_of_library() {
+        let p = mac();
+        assert!(p
+            .check_delete("/Users/alice/Library/Caches/com.foo.bar/data")
+            .is_ok());
+        assert!(p.check_delete("/Users/alice/Library/Caches").is_err());
+        assert!(p
+            .check_delete("/Users/alice/Library/Application Support/Foo")
+            .is_err());
+        assert!(p.check_delete("/Users/alice/Library").is_err());
+    }
+
+    #[test]
+    fn matching_is_case_insensitive_like_default_apfs() {
+        let p = mac();
+        assert!(p.check_delete("/users/ALICE/documents/report.pdf").is_err());
+        assert!(p.check_delete("/SYSTEM/Library/x").is_err());
+        assert!(p
+            .check_delete("/users/alice/library/caches/com.foo/x")
+            .is_ok());
+    }
+
+    #[test]
+    fn system_apps_user_content_and_roots_are_protected() {
+        let p = mac();
+        for path in [
+            "/",
+            "/System/Library/CoreServices",
+            "/usr/bin/ls",
+            "/Applications/Safari.app",
+            "/Library/Preferences/x.plist",
+            "/private/etc/hosts",
+            "/Users/alice",
+            "/Users/alice/Desktop/a.txt",
+            "/Users/alice/Downloads/b.zip",
+            "/Volumes/Backup/x",
+        ] {
+            assert!(p.check_delete(path).is_err(), "{path} must be refused");
+        }
+        assert_eq!(
+            p.check_delete("/Users/alice/.ssh/id_rsa"),
+            Err(Denied::ProtectedName(".ssh".into()))
+        );
+        assert_eq!(p.check_delete("relative/path"), Err(Denied::NotAbsolute));
+        assert_eq!(
+            p.check_delete("/Users/alice/Library/Caches/../../../etc"),
+            Err(Denied::ContainsParentRef)
+        );
+    }
+
+    #[test]
+    fn user_selected_policy_allows_downloads_but_not_library_or_system() {
+        let p = SafetyPolicy::for_user_selected_mac("/Users/alice").unwrap();
+        assert!(p.check_delete("/Users/alice/Downloads/old.dmg").is_ok());
+        assert!(p
+            .check_delete("/Users/alice/Library/Application Support/x")
+            .is_err());
+        assert!(p.check_delete("/Applications/Foo.app").is_err());
+        assert!(p.check_delete("/System/x").is_err());
     }
 }
 

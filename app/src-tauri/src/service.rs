@@ -292,7 +292,7 @@ pub struct AppDto {
     pub install_date: Option<String>,
     pub size_kb: Option<u64>,
     pub install_location: Option<String>,
-    /// `desktop` 或 `store`。
+    /// `desktop`、`store` 或 `bundle`（macOS 的 `.app`）。
     pub kind: &'static str,
     /// 有可用的卸载命令（Store 应用总是可以）。没有时只能"强制删除"。
     pub can_uninstall: bool,
@@ -454,6 +454,8 @@ pub struct MigrateParts {
     pub manifest_path: PathBuf,
     pub program_dirs: Vec<PathBuf>,
     pub system_dirs: Vec<PathBuf>,
+    /// macOS：符号链接代替 junction、路径不经命令解释器等（见 `PreflightOptions::unix_links`）。
+    pub unix_links: bool,
     pub self_pid: u32,
     /// 停止进程时的等待时间（生产环境用默认值，测试用极短值）。
     pub stop_timing: StopTiming,
@@ -510,6 +512,19 @@ pub struct Service {
     apps: Mutex<Vec<InstalledApp>>,
     leftovers: Mutex<Option<LeftoverState>>,
     mig: Option<MigState>,
+    /// macOS：应用管理的配置（家目录、应用目录、移入废纸篓的方式）。
+    mac: Option<MacConfig>,
+}
+
+/// 把一个路径移入废纸篓的函数。
+pub type TrashFn = dyn Fn(&Path) -> std::io::Result<()> + Send + Sync;
+
+/// macOS 应用管理所需的外部能力。
+pub struct MacConfig {
+    pub home: String,
+    pub app_roots: Vec<PathBuf>,
+    /// 把应用包移入废纸篓（生产环境用 `trash` crate，测试注入假实现）。
+    pub trash: Arc<TrashFn>,
 }
 
 struct LeftoverState {
@@ -546,7 +561,14 @@ impl Service {
             apps: Mutex::new(Vec::new()),
             leftovers: Mutex::new(None),
             mig: None,
+            mac: None,
         }
+    }
+
+    /// 启用 macOS 的应用管理（枚举 `.app`、移入废纸篓、`~/Library` 残留）。
+    pub fn with_mac(mut self, mac: MacConfig) -> Self {
+        self.mac = Some(mac);
+        self
     }
 
     /// 注入目录迁移所需的外部能力，并读取迁移清单。
@@ -591,6 +613,7 @@ impl Service {
             .list()
             .iter()
             .filter(|d| d.total_space() > 0)
+            .filter(|d| !is_hidden_mount(d.mount_point()))
             .map(|d| DriveDto {
                 mount: display_path(d.mount_point()),
                 name: d.name().to_string_lossy().into_owned(),
@@ -1051,6 +1074,17 @@ impl Service {
 
     /// 列出已装程序（传统程序 + Store 应用）。Store 应用的枚举失败不影响传统程序。
     pub fn apps_list(&self, include_store: bool) -> Result<Vec<AppDto>> {
+        if let Some(mac) = &self.mac {
+            let apps = diskclean_core::macapps::enumerate_mac_apps(&mac.app_roots);
+            let dtos = apps
+                .iter()
+                .enumerate()
+                .map(|(i, a)| app_dto(i, a))
+                .collect();
+            *self.apps.lock().unwrap() = apps;
+            *self.leftovers.lock().unwrap() = None;
+            return Ok(dtos);
+        }
         if let Err(e) = self.registry.subkeys(Hive::LocalMachine, "SOFTWARE") {
             if e.kind() == std::io::ErrorKind::Unsupported {
                 return Err(ApiError::new("unsupported_platform"));
@@ -1086,6 +1120,21 @@ impl Service {
     /// 运行程序自带的卸载器并等待它结束。
     pub fn app_uninstall(&self, id: usize, silent: bool) -> Result<UninstallRunDto> {
         let app = self.app_by_id(id)?;
+        if let (Some(mac), AppSource::MacBundle { path, .. }) = (&self.mac, &app.source) {
+            diskclean_core::macapps::uninstall_mac_bundle(&app, &mac.app_roots, &*mac.trash)
+                .map_err(|e| match e {
+                    diskclean_core::macapps::MacUninstallError::Refused(m) => {
+                        ApiError::with("invalid_command", m)
+                    }
+                    diskclean_core::macapps::MacUninstallError::Failed(m) => {
+                        ApiError::with("uninstall_failed", m)
+                    }
+                })?;
+            return Ok(UninstallRunDto {
+                exit_code: 0,
+                still_registered: std::fs::symlink_metadata(path).is_ok(),
+            });
+        }
         let run =
             uninstall::run_uninstaller(&app, silent, self.runner.as_ref(), self.registry.as_ref())
                 .map_err(|e| match e {
@@ -1108,14 +1157,19 @@ impl Service {
     ) -> Result<LeftoversDto> {
         let app = self.app_by_id(id)?;
         let policy = (self.leftover_policy_factory)(exclusions)?;
-        let scan = uninstall::scan_leftovers(
-            &app,
-            &self.fs_roots,
-            &self.env,
-            self.registry.as_ref(),
-            &policy,
-            forced,
-        );
+        let scan = match &self.mac {
+            Some(mac) => {
+                diskclean_core::macapps::scan_mac_leftovers(&app, &mac.home, &policy, forced)
+            }
+            None => uninstall::scan_leftovers(
+                &app,
+                &self.fs_roots,
+                &self.env,
+                self.registry.as_ref(),
+                &policy,
+                forced,
+            ),
+        };
         let dto = leftovers_dto(&scan);
         *self.leftovers.lock().unwrap() = Some(LeftoverState {
             app_name: app.name.clone(),
@@ -1356,6 +1410,7 @@ impl Service {
         let policy = (m.parts.policy_factory)(exclusions)?;
         let opts = PreflightOptions {
             program_dirs: m.parts.program_dirs.clone(),
+            unix_links: m.parts.unix_links,
             // 云同步目录不能迁移（搬走会破坏同步），与"是否分析云端"的设置无关。
             cloud: CloudRules::new(false, &[], &self.env),
         };
@@ -1475,6 +1530,7 @@ impl Service {
         m.cancel.store(false, Ordering::Relaxed);
         let opts = PreflightOptions {
             program_dirs: m.parts.program_dirs.clone(),
+            unix_links: m.parts.unix_links,
             // 云同步目录不能迁移（搬走会破坏同步），与"是否分析云端"的设置无关。
             cloud: CloudRules::new(false, &[], &self.env),
         };
@@ -1534,7 +1590,7 @@ impl Service {
     // ----- 系统动作 -----
 
     pub fn sys_list(&self) -> Vec<SysActionDto> {
-        sysaction::SYSTEM_ACTIONS
+        sysaction::platform_actions()
             .iter()
             .map(|a| SysActionDto {
                 id: a.id,
@@ -1721,7 +1777,8 @@ fn format_install_date(raw: &Option<String>) -> Option<String> {
 
 fn app_dto(id: usize, a: &InstalledApp) -> AppDto {
     let store = matches!(a.source, AppSource::Appx { .. });
-    let command = (!store)
+    let bundle = matches!(a.source, AppSource::MacBundle { .. });
+    let command = (!store && !bundle)
         .then(|| uninstall::uninstall_command(a, false).ok())
         .flatten();
     AppDto {
@@ -1732,8 +1789,14 @@ fn app_dto(id: usize, a: &InstalledApp) -> AppDto {
         install_date: format_install_date(&a.install_date),
         size_kb: a.size_kb,
         install_location: a.install_location.clone(),
-        kind: if store { "store" } else { "desktop" },
-        can_uninstall: store || command.is_some(),
+        kind: if store {
+            "store"
+        } else if bundle {
+            "bundle"
+        } else {
+            "desktop"
+        },
+        can_uninstall: store || bundle || command.is_some(),
         uninstall_command: command,
     }
 }
@@ -1749,6 +1812,7 @@ fn leftovers_dto(scan: &LeftoverScan) -> LeftoversDto {
         Reason::StaleService => "stale_service",
         Reason::ComRegistration => "com_registration",
         Reason::Shortcut => "shortcut",
+        Reason::BundleId => "bundle_id",
     };
     let items: Vec<LeftoverDto> = scan
         .items
@@ -1910,8 +1974,23 @@ fn report_dto(report: &Report, dry_run: bool, journal_path: &Path) -> ReportDto 
 }
 
 /// 系统盘的可用空间。`SystemDrive` 形如 `C:`；匹配不到时返回 `None`。
+/// macOS 的 APFS 会挂载一堆内部卷（Preboot、VM、Update……），不是用户要分析的磁盘。
+fn is_hidden_mount(mount: &Path) -> bool {
+    let m = mount.to_string_lossy();
+    m.starts_with("/System/Volumes/") && m != "/System/Volumes/Data"
+        || m.starts_with("/private/var/vm")
+        || m.starts_with("/System/Volumes/Data/")
+}
+
 fn free_space(env: &Env) -> Option<u64> {
-    let drive = env.get("SystemDrive")?.to_lowercase();
+    let Some(drive) = env.get("SystemDrive").map(str::to_lowercase) else {
+        // 没有"系统盘符"的平台（macOS）：用启动卷 `/`。
+        return sysinfo::Disks::new_with_refreshed_list()
+            .list()
+            .iter()
+            .find(|d| d.mount_point() == Path::new("/"))
+            .map(|d| d.available_space());
+    };
     sysinfo::Disks::new_with_refreshed_list()
         .list()
         .iter()
@@ -3417,6 +3496,7 @@ mod tests {
                 manifest_path: d.join("meta/migrations.json"),
                 program_dirs: vec![],
                 system_dirs: vec![PathBuf::from("/windows")],
+                unix_links: false,
                 self_pid: 999,
                 stop_timing: StopTiming {
                     graceful_wait: std::time::Duration::from_millis(10),
@@ -4094,6 +4174,7 @@ mod tests {
             manifest_path: d.join("meta/m.json"),
             program_dirs: vec![],
             system_dirs: vec![],
+            unix_links: false,
             self_pid: 999,
             stop_timing: StopTiming::default(),
         })
@@ -4364,6 +4445,94 @@ mod tests {
         assert_eq!(proj.items.len(), 1);
         assert_eq!(proj.small_size, 500);
         assert_eq!(proj.small_files, 5);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn mac_apps_are_listed_trashed_and_their_library_leftovers_removed() {
+        use diskclean_core::macapps;
+        let d = sandbox();
+        let home = d.join("Users/alice");
+        let write_plist = |rel: &str, name: &str, id: &str| {
+            let p = d.join(rel).join("Contents/Info.plist");
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(
+                p,
+                format!(
+                    "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict>\
+                     <key>CFBundleName</key><string>{name}</string>\
+                     <key>CFBundleIdentifier</key><string>{id}</string></dict></plist>"
+                ),
+            )
+            .unwrap();
+        };
+        write_plist("Applications/Foo.app", "Foo", "com.acme.foo");
+        write(&d.join("Applications/Foo.app/Contents/MacOS/foo"), 8192);
+        write(&home.join("Library/Caches/com.acme.foo/c.bin"), 4000);
+        write(&home.join("Library/Application Support/Foo/data"), 3000);
+        write(&home.join("Library/Application Support/Other/x"), 10);
+
+        let trashed = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
+        let t2 = trashed.clone();
+        let home_s = home.to_string_lossy().into_owned();
+        let policy_home = home_s.clone();
+        let factory: Box<PolicyFactory> = Box::new(move |_| {
+            // 沙盒在系统临时目录下（macOS 上是受保护的 /private/var）：基础策略只保护家目录。
+            let mut base = SafetyPolicy::empty(test_style());
+            for d in ["", "/Library"] {
+                base.protect(&format!("{policy_home}{d}"))
+                    .map_err(|e| ApiError::with("policy", e))?;
+            }
+            macapps::leftover_policy_on(base, &policy_home).map_err(|e| ApiError::with("policy", e))
+        });
+        let svc = service(&d)
+            .with_uninstall(Arc::new(NoRegistry), factory, FsRoots::default())
+            .with_mac(MacConfig {
+                home: home_s,
+                app_roots: vec![d.join("Applications")],
+                // 假的"移入废纸篓"：真的把它挪走，这样之后的"仍已安装"判断才有意义。
+                trash: Arc::new(move |p| {
+                    t2.lock().unwrap().push(p.to_path_buf());
+                    fs::remove_dir_all(p)
+                }),
+            });
+
+        let apps = svc.apps_list(false).unwrap();
+        let foo = apps.iter().find(|a| a.name == "Foo").unwrap();
+        assert_eq!(foo.kind, "bundle");
+        assert!(foo.can_uninstall && foo.uninstall_command.is_none());
+
+        // 应用还在：不给残留。
+        let early = svc.app_leftovers(foo.id, false, &[]).unwrap();
+        assert!(early.still_registered && early.items.is_empty());
+
+        let run = svc.app_uninstall(foo.id, false).unwrap();
+        assert_eq!((run.exit_code, run.still_registered), (0, false));
+        assert_eq!(*trashed.lock().unwrap(), [d.join("Applications/Foo.app")]);
+
+        let left = svc.app_leftovers(foo.id, false, &[]).unwrap();
+        let mut paths: Vec<_> = left
+            .items
+            .iter()
+            .map(|i| (i.path.replace('\\', "/"), i.reason, i.default_selected))
+            .collect();
+        paths.sort();
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert!(paths[0].0.ends_with("Library/Application Support/Foo"));
+        assert_eq!(paths[0].1, "name_match");
+        assert!(!paths[0].2, "名称匹配把握较小，不默认勾选");
+        assert!(paths[1].0.ends_with("Library/Caches/com.acme.foo"));
+        assert_eq!(paths[1].1, "bundle_id");
+        assert!(paths[1].2);
+
+        let all: Vec<usize> = left.items.iter().map(|i| i.id).collect();
+        let rep = svc
+            .app_delete_leftovers(&all, false, &d.join("backup"), &d.join("j.jsonl"))
+            .unwrap();
+        assert_eq!(rep.files.deleted, 2);
+        assert!(!home.join("Library/Caches/com.acme.foo").exists());
+        assert!(!home.join("Library/Application Support/Foo").exists());
+        assert!(home.join("Library/Application Support/Other/x").exists());
         fs::remove_dir_all(&d).unwrap();
     }
 }

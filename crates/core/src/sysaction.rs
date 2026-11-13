@@ -289,6 +289,12 @@ pub enum SysKind {
     RemoveWindowsOld,
     /// 删除最早的一个卷影副本（还原点）。
     DeleteOldestShadowCopy,
+    /// macOS：精简 Time Machine 的本地快照（需要管理员密码）。
+    MacThinSnapshots,
+    /// macOS：`brew cleanup --prune=all`，删除 Homebrew 的旧版本与下载缓存。
+    MacBrewCleanup,
+    /// macOS：`xcrun simctl delete unavailable`，删除已不可用的 iOS 模拟器。
+    MacDeleteUnavailableSimulators,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -326,8 +332,53 @@ pub const SYSTEM_ACTIONS: &[SysAction] = &[
     },
 ];
 
+/// macOS 的系统动作：都交给系统或包管理器自己的工具，不手动删除系统文件。
+pub const MAC_ACTIONS: &[SysAction] = &[
+    SysAction {
+        id: "mac_snapshots",
+        kind: SysKind::MacThinSnapshots,
+        risk: Risk::Medium,
+    },
+    SysAction {
+        id: "mac_brew",
+        kind: SysKind::MacBrewCleanup,
+        risk: Risk::Low,
+    },
+    SysAction {
+        id: "mac_simulators",
+        kind: SysKind::MacDeleteUnavailableSimulators,
+        risk: Risk::Low,
+    },
+];
+
+/// 当前平台提供的系统动作。
+pub fn platform_actions() -> &'static [SysAction] {
+    if cfg!(target_os = "macos") {
+        MAC_ACTIONS
+    } else {
+        SYSTEM_ACTIONS
+    }
+}
+
 pub fn find_action(id: &str) -> Option<&'static SysAction> {
-    SYSTEM_ACTIONS.iter().find(|a| a.id == id)
+    SYSTEM_ACTIONS
+        .iter()
+        .chain(MAC_ACTIONS)
+        .find(|a| a.id == id)
+}
+
+/// Homebrew 的可执行文件：Apple 芯片与 Intel 的默认安装位置。
+/// 图形界面启动的程序 PATH 很短，不能靠 `brew` 这个名字查找。
+fn find_brew() -> Option<&'static str> {
+    ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
+        .into_iter()
+        .find(|p| Path::new(p).is_file())
+}
+
+/// 经系统的授权对话框以管理员身份运行一条**固定**的命令（不拼接任何外部输入）。
+fn run_as_admin(runner: &dyn CommandRunner, shell_command: &str) -> SysResult<String> {
+    let script = format!("do shell script \"{shell_command}\" with administrator privileges");
+    ok_or_fail(runner, "osascript", &["-e", &script])
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -363,6 +414,15 @@ fn system_root(env: &Env) -> SysResult<PathBuf> {
 impl SysAction {
     /// 预计能释放的字节数；无法估算（或没有可清理内容）时为 `None`。
     pub fn estimate(&self, env: &Env) -> Option<u64> {
+        if matches!(
+            self.kind,
+            SysKind::MacThinSnapshots
+                | SysKind::MacBrewCleanup
+                | SysKind::MacDeleteUnavailableSimulators
+        ) {
+            // 释放量由系统工具决定，输出随版本变化，不做不可靠的估算。
+            return None;
+        }
         let root = system_root(env).ok()?;
         match self.kind {
             SysKind::EmptyRecycleBin => dir_size(&root.join("$Recycle.Bin")),
@@ -371,13 +431,28 @@ impl SysAction {
                 .map(|m| m.len()),
             SysKind::RemoveWindowsOld => dir_size(&root.join("Windows.old")),
             // 释放量取决于系统内部的分析结果，输出又随语言变化，不做不可靠的估算。
-            SysKind::ComponentCleanup | SysKind::DeleteOldestShadowCopy => None,
+            _ => None,
         }
     }
 
     /// 执行动作，返回给用户看的简短说明。
     pub fn run(&self, env: &Env, runner: &dyn CommandRunner) -> SysResult<String> {
         match self.kind {
+            SysKind::MacThinSnapshots => run_as_admin(
+                runner,
+                // 请求释放尽可能多的空间，紧急程度 4（最高）；只动本地快照，不碰外置备份。
+                "/usr/bin/tmutil thinlocalsnapshots / 9999999999999 4",
+            ),
+            SysKind::MacBrewCleanup => {
+                let brew = find_brew()
+                    .ok_or_else(|| SysError::new("not_found", "Homebrew is not installed"))?;
+                ok_or_fail(runner, brew, &["cleanup", "--prune=all"])
+            }
+            SysKind::MacDeleteUnavailableSimulators => ok_or_fail(
+                runner,
+                "/usr/bin/xcrun",
+                &["simctl", "delete", "unavailable"],
+            ),
             SysKind::EmptyRecycleBin => ok_or_fail(
                 runner,
                 "powershell.exe",
@@ -521,6 +596,47 @@ mod tests {
     }
 
     // ----- 服务控制 -----
+
+    #[test]
+    fn mac_actions_use_system_tools_and_a_fixed_admin_prompt() {
+        let env = Env::from_pairs([("HOME", "/Users/alice")]);
+        let fake = Fake::with(vec![out(0, "Thinned local snapshots")]);
+        let snap = find_action("mac_snapshots").unwrap();
+        snap.run(&env, &fake).unwrap();
+        assert_eq!(
+            fake.calls(),
+            ["osascript -e do shell script \"/usr/bin/tmutil thinlocalsnapshots / 9999999999999 4\" with administrator privileges"]
+        );
+
+        let fake = Fake::with(vec![out(0, "")]);
+        find_action("mac_simulators")
+            .unwrap()
+            .run(&env, &fake)
+            .unwrap();
+        assert_eq!(fake.calls(), ["/usr/bin/xcrun simctl delete unavailable"]);
+
+        // 取消管理员授权时 osascript 返回非零，应报告失败而不是当成功。
+        let fake = Fake::with(vec![CmdOutput {
+            code: 1,
+            stdout: String::new(),
+            stderr: "User canceled. (-128)".into(),
+        }]);
+        let err = snap.run(&env, &fake).unwrap_err();
+        assert_eq!(err.code, "command_failed");
+        assert!(err.detail.contains("User canceled"));
+    }
+
+    #[test]
+    fn platform_actions_are_distinct_and_all_findable() {
+        let win: Vec<_> = SYSTEM_ACTIONS.iter().map(|a| a.id).collect();
+        for a in MAC_ACTIONS {
+            assert!(!win.contains(&a.id));
+            assert!(find_action(a.id).is_some());
+        }
+        assert!(MAC_ACTIONS
+            .iter()
+            .all(|a| a.estimate(&Env::default()).is_none()));
+    }
 
     #[test]
     fn stops_a_running_service_and_waits_until_stopped() {

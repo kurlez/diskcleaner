@@ -93,7 +93,25 @@ pub struct CloudRules {
     skip_paths: Vec<String>,
     /// 由环境变量得到的精确云同步根目录。
     cloud_roots: Vec<(String, &'static str)>,
+    /// macOS：扫描时跳过会重复计数或没有意义的系统位置（`/System/Volumes`、`/Volumes`、交换文件等）。
+    mac_system: bool,
 }
+
+/// macOS 上扫描整个启动盘时要跳过的位置（小写、`\` 连接的分量）。
+/// `/System/Volumes/Data` 通过 firmlink 已经出现在 `/Users` 等处，再进去会重复计数；
+/// `/Volumes` 是其他磁盘的挂载点，应单独分析。
+const MAC_SYSTEM_SKIP: &[&str] = &[
+    "system\\volumes",
+    "volumes",
+    "dev",
+    "network",
+    "cores",
+    ".vol",
+    ".spotlight-v100",
+    ".fseventsd",
+    ".documentrevisions-v100",
+    "private\\var\\vm",
+];
 
 /// 被排除的目录。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,12 +126,24 @@ pub struct Excluded {
 impl CloudRules {
     /// `analyze_cloud` 为假（默认）时排除云同步目录；`skip_paths` 总是被跳过。
     pub fn new(analyze_cloud: bool, skip_paths: &[String], env: &Env) -> Self {
-        let cloud_roots = ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"]
-            .iter()
-            .filter_map(|k| env.get(k))
-            .map(|p| (norm(Path::new(p)), "OneDrive"))
-            .collect();
+        let mut cloud_roots: Vec<(String, &'static str)> =
+            ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"]
+                .iter()
+                .filter_map(|k| env.get(k))
+                .map(|p| (norm(Path::new(p)), "OneDrive"))
+                .collect();
+        // macOS：iCloud Drive 与"文件提供程序"（Google Drive、OneDrive、Dropbox 等）都挂在资料库下。
+        if let Some(home) = env.get("HOME").filter(|h| h.starts_with('/')) {
+            let home = home.trim_end_matches('/');
+            for (sub, provider) in [
+                ("Library/Mobile Documents", "iCloud Drive"),
+                ("Library/CloudStorage", "Cloud Storage"),
+            ] {
+                cloud_roots.push((norm(Path::new(&format!("{home}/{sub}"))), provider));
+            }
+        }
         Self {
+            mac_system: cfg!(target_os = "macos"),
             analyze_cloud,
             skip_paths: skip_paths
                 .iter()
@@ -122,6 +152,12 @@ impl CloudRules {
                 .collect(),
             cloud_roots,
         }
+    }
+
+    /// 开关"跳过 macOS 系统位置"（默认只在 macOS 上开启；测试可显式打开）。
+    pub fn with_mac_system(mut self, on: bool) -> Self {
+        self.mac_system = on;
+        self
     }
 
     /// 什么都不排除。
@@ -149,6 +185,9 @@ impl CloudRules {
         let n = c.join("\\").to_lowercase();
         if self.skip_paths.contains(&n) {
             return Some("custom".into());
+        }
+        if self.mac_system && MAC_SYSTEM_SKIP.contains(&n.as_str()) {
+            return Some("system".into());
         }
         if self.analyze_cloud {
             return None;
@@ -370,6 +409,50 @@ mod tests {
         assert_eq!(r.location_excluded(Path::new(r"D:\Projects\x")), None);
         assert_eq!(
             CloudRules::none().location_excluded(Path::new(r"D:\Google Drive\x")),
+            None
+        );
+    }
+
+    #[test]
+    fn mac_cloud_locations_and_system_volumes_are_skipped() {
+        let r = rules(false, &[], &[("HOME", "/Users/alice")]).with_mac_system(true);
+        assert_eq!(
+            r.excluded_dir(Path::new("/Users/alice/Library/Mobile Documents")),
+            Some("iCloud Drive".into())
+        );
+        assert_eq!(
+            r.excluded_dir(Path::new("/Users/alice/Library/CloudStorage")),
+            Some("Cloud Storage".into())
+        );
+        assert_eq!(
+            r.excluded_dir(Path::new(
+                "/Users/alice/Library/CloudStorage/GoogleDrive-a@b.com"
+            )),
+            Some("Google Drive".into())
+        );
+        assert_eq!(
+            r.excluded_dir(Path::new("/System/Volumes")),
+            Some("system".into())
+        );
+        assert_eq!(r.excluded_dir(Path::new("/Volumes")), Some("system".into()));
+        assert_eq!(
+            r.excluded_dir(Path::new("/private/var/vm")),
+            Some("system".into())
+        );
+        // 普通目录，包括名字相近的，都不受影响；/System 其余部分照常统计。
+        for p in [
+            "/Users/alice/Library/Caches",
+            "/System/Library",
+            "/Users/alice/volumes",
+            "/private/var/folders",
+        ] {
+            assert_eq!(r.excluded_dir(Path::new(p)), None, "{p}");
+        }
+        // 关闭开关后系统位置不再跳过；"分析云盘"时云目录也不跳过。
+        let off = rules(true, &[], &[("HOME", "/Users/alice")]).with_mac_system(false);
+        assert_eq!(off.excluded_dir(Path::new("/Volumes")), None);
+        assert_eq!(
+            off.excluded_dir(Path::new("/Users/alice/Library/CloudStorage")),
             None
         );
     }
