@@ -769,6 +769,8 @@ pub struct StopTiming {
     /// 强制结束后最多等多久。
     pub force_wait: Duration,
     pub poll: Duration,
+    /// 结束进程用的命令（Windows 的 `taskkill` 或 macOS 的 `kill`）。
+    pub commands: StopCommands,
 }
 
 impl Default for StopTiming {
@@ -777,6 +779,7 @@ impl Default for StopTiming {
             graceful_wait: Duration::from_secs(8),
             force_wait: Duration::from_secs(3),
             poll: Duration::from_millis(250),
+            commands: StopCommands::for_platform(),
         }
     }
 }
@@ -864,7 +867,7 @@ pub fn execute_stop(
             continue;
         }
         let pid = step.pid.to_string();
-        let cmds = StopCommands::for_platform();
+        let cmds = timing.commands;
         // 礼貌地请求关闭（Windows 向窗口发送关闭消息；macOS 发送 SIGTERM）。
         let (prog, args) = cmds.graceful(&pid);
         let _ = runner.run(prog, &args.iter().map(String::as_str).collect::<Vec<_>>());
@@ -1416,6 +1419,8 @@ mod tests {
             graceful_wait: Duration::from_millis(10),
             force_wait: Duration::from_millis(10),
             poll: Duration::from_millis(1),
+            // 测试里的假执行器模拟的是 taskkill，与测试运行的平台无关。
+            commands: StopCommands::Windows,
         }
     }
 

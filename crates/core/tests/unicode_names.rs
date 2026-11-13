@@ -19,6 +19,16 @@ use diskclean_core::scanner;
 static N: AtomicU64 = AtomicU64::new(0);
 
 /// 覆盖常见脚本、emoji（需要代理对）、全角符号、空格、点号、预组合与分解形式的重音字符。
+/// macOS 的文件系统不区分 Unicode 的组合与分解写法（`é` 与 `e` + 重音符号是同一个名字），
+/// 所以分解写法的那个名字在 macOS 上只能和组合写法共存为一个文件，不单独测试。
+fn names() -> Vec<&'static str> {
+    NAMES
+        .iter()
+        .copied()
+        .filter(|n| !(cfg!(target_os = "macos") && *n == "cafe\u{301}.txt"))
+        .collect()
+}
+
 const NAMES: &[&str] = &[
     "项目 报告 (终稿).docx",
     "日本語のファイル.txt",
@@ -56,7 +66,7 @@ impl Drop for Sb {
 }
 
 fn populate(sb: &Sb) {
-    for (i, n) in NAMES.iter().enumerate() {
+    for (i, n) in names().iter().enumerate() {
         let dir = sb.p("资料库/二级目录 📁");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(n), vec![b'x'; 100 + i]).unwrap();
@@ -73,7 +83,7 @@ fn the_scanner_reports_every_name_exactly() {
     let sub = &lib.children[0];
     assert_eq!(sub.name, "二级目录 📁");
     let mut got: Vec<&str> = sub.children.iter().map(|c| c.name.as_str()).collect();
-    let mut want: Vec<&str> = NAMES.to_vec();
+    let mut want: Vec<&str> = names();
     got.sort();
     want.sort();
     assert_eq!(got, want, "文件名必须逐字符一致");
@@ -82,7 +92,10 @@ fn the_scanner_reports_every_name_exactly() {
         "不能出现替换字符"
     );
     // 预组合与分解形式是两个不同的文件，不能被合并。
-    assert_eq!(NAMES.iter().filter(|n| n.starts_with("caf")).count(), 2);
+    assert_eq!(
+        names().iter().filter(|n| n.starts_with("caf")).count(),
+        if cfg!(target_os = "macos") { 1 } else { 2 }
+    );
     assert_eq!(
         sub.children
             .iter()
@@ -142,7 +155,7 @@ fn copying_and_verifying_preserve_unicode_names() {
         .unwrap();
     verify_equal(&sb.p("资料库"), &dst).unwrap();
     let m = manifest_of(&dst).unwrap();
-    for n in NAMES {
+    for n in names() {
         assert!(m.contains_key(&format!("二级目录 📁/{n}")), "缺少 {n}");
     }
 }
@@ -273,7 +286,8 @@ fn rules_work_in_directories_with_unicode_names() {
 
 /// 不合法的文件名（Linux 上是非 UTF-8 字节，Windows 上对应未配对的代理项）：
 /// 不能崩溃，不能被误删，也不能被当成别的文件。
-#[cfg(unix)]
+// macOS 不允许创建非 UTF-8 的文件名，所以这个场景只在其他 Unix 上存在。
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn invalid_encoding_in_a_file_name_is_survived_and_never_deleted() {
     use std::ffi::OsString;

@@ -445,7 +445,7 @@ mod tests {
                     path.strip_prefix(sb.p("Users/alice/Library"))
                         .unwrap()
                         .to_string_lossy()
-                        .into_owned(),
+                        .replace('\\', "/"),
                     l.confidence,
                     l.reason,
                 ),

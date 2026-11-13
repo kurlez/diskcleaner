@@ -2711,10 +2711,13 @@ mod tests {
         assert!(log.contains("\"ok\":true") && log.contains("\"ok\":false"));
 
         let list = svc.sys_list();
-        assert_eq!(list.len(), 5);
-        assert!(list
-            .iter()
-            .any(|a| a.id == "windows_old" && a.risk == Risk::High));
+        assert_eq!(list.len(), sysaction::platform_actions().len());
+        if !cfg!(target_os = "macos") {
+            assert_eq!(list.len(), 5);
+            assert!(list
+                .iter()
+                .any(|a| a.id == "windows_old" && a.risk == Risk::High));
+        }
         fs::remove_dir_all(&d).unwrap();
     }
 
@@ -3502,6 +3505,8 @@ mod tests {
                     graceful_wait: std::time::Duration::from_millis(10),
                     force_wait: std::time::Duration::from_millis(10),
                     poll: std::time::Duration::from_millis(1),
+                    // 测试里的假执行器模拟的是 taskkill，与测试运行的平台无关。
+                    commands: diskclean_core::procs::StopCommands::Windows,
                 },
             })
     }
